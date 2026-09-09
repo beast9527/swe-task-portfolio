@@ -1,0 +1,791 @@
+diff --git a/minecraft_mod_manager/config_cli_test.py b/minecraft_mod_manager/config_cli_test.py
+new file mode 100644
+index 0000000..1bbfa52
+--- /dev/null
++++ b/minecraft_mod_manager/config_cli_test.py
+@@ -0,0 +1,141 @@
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++
++_REPO_ROOT = Path(__file__).resolve().parents[1]
++_DB_NAME = ".minecraft-mod-manager.db"
++
++
++def _run_main(work_dir, cli_args, home_dir=None):
++    env = dict(os.environ)
++    env["PYTHONPATH"] = str(_REPO_ROOT)
++    home = Path(home_dir) if home_dir else (work_dir / "home")
++    home.mkdir(parents=True, exist_ok=True)
++    env["HOME"] = str(home)
++
++    cmd = [sys.executable, "-m", "minecraft_mod_manager", *cli_args]
++    return subprocess.run(cmd, cwd=str(work_dir), env=env, capture_output=True, text=True, timeout=120)
++
++
++def test_main_print_config_without_config_file_prints_builtin_defaults(tmp_path):
++    proc = _run_main(tmp_path, ["list", "--print-config"])
++
++    assert proc.returncode == 0, proc.stderr
++    expected = {
++        "dir": ".",
++        "filter": {"version": None, "stability": None},
++        "mod_loader": None,
++        "minecraft_version": None,
++        "stability": None,
++    }
++    assert json.loads(proc.stdout) == expected
++    assert proc.stdout.endswith("\n")
++    # No application action may run: no database must be created
++    assert not (tmp_path / _DB_NAME).exists()
++
++
++def test_main_print_config_uses_config_file_settings(tmp_path):
++    mods_dir = tmp_path / "mods"
++    mods_dir.mkdir()
++    settings = {
++        "dir": str(mods_dir),
++        "filter": {"version": "1.16.5", "stability": "release"},
++        "mod_loader": "forge",
++        "minecraft_version": "1.16.5",
++        "stability": "release",
++    }
++    (tmp_path / "minecraft_mod_manager.json").write_text(json.dumps(settings), encoding="utf-8")
++
++    proc = _run_main(tmp_path, ["list", "--print-config"])
++
++    assert proc.returncode == 0, proc.stderr
++    assert json.loads(proc.stdout) == settings
++
++
++def test_main_print_config_cli_argument_overrides_config_file(tmp_path):
++    mods_dir = tmp_path / "mods"
++    mods_dir.mkdir()
++    settings = {
++        "dir": str(mods_dir),
++        "filter": {"version": "1.16.5", "stability": "release"},
++        "mod_loader": "forge",
++        "minecraft_version": "1.16.5",
++        "stability": "release",
++    }
++    (tmp_path / "minecraft_mod_manager.json").write_text(json.dumps(settings), encoding="utf-8")
++
++    proc = _run_main(tmp_path, ["list", "--print-config", "--mod-loader", "fabric"])
++
++    assert proc.returncode == 0, proc.stderr
++    expected = dict(settings)
++    expected["mod_loader"] = "fabric"
++    assert json.loads(proc.stdout) == expected
++
++
++def test_main_print_config_honors_explicit_config_path(tmp_path):
++    cwd = tmp_path / "cwd"
++    cwd.mkdir()
++    explicit_settings = {
++        "dir": ".",
++        "filter": {"version": "1.20", "stability": "release"},
++        "mod_loader": "quilt",
++        "minecraft_version": "1.20",
++        "stability": "release",
++    }
++    explicit = tmp_path / "custom-config.json"
++    explicit.write_text(json.dumps(explicit_settings), encoding="utf-8")
++    # A conflicting file in the current directory must not win over --config
++    (cwd / "minecraft_mod_manager.json").write_text(
++        json.dumps({"dir": ".", "mod_loader": "forge"}), encoding="utf-8"
++    )
++
++    proc = _run_main(cwd, ["list", "--print-config", "--config", str(explicit)])
++
++    assert proc.returncode == 0, proc.stderr
++    assert json.loads(proc.stdout) == explicit_settings
++
++
++def test_main_validation_failure_exits_nonzero_and_reports_errors_on_stderr(tmp_path):
++    (tmp_path / "minecraft_mod_manager.json").write_text(
++        json.dumps({"dir": ".", "mod_loader": "spigot", "stability": "nightly"}),
++        encoding="utf-8",
++    )
++
++    proc = _run_main(tmp_path, ["list"])
++
++    assert proc.returncode != 0
++    assert "mod_loader" in proc.stderr
++    assert "stability" in proc.stderr
++
++
++def test_main_config_file_directory_is_applied_before_action(tmp_path):
++    mods_dir = tmp_path / "mods"
++    mods_dir.mkdir()
++    (tmp_path / "minecraft_mod_manager.json").write_text(
++        json.dumps({"dir": str(mods_dir), "mod_loader": "fabric"}), encoding="utf-8"
++    )
++
++    proc = _run_main(tmp_path, ["list"])
++
++    assert proc.returncode == 0, proc.stderr
++    assert (mods_dir / _DB_NAME).exists()
++
++
++def test_main_config_file_is_discovered_in_home_directory(tmp_path):
++    work_dir = tmp_path / "work"
++    work_dir.mkdir()
++    home = tmp_path / "home"
++    home.mkdir()
++    mods_dir = tmp_path / "mods"
++    mods_dir.mkdir()
++    (home / ".minecraft_mod_manager.json").write_text(
++        json.dumps({"dir": str(mods_dir), "mod_loader": "fabric"}), encoding="utf-8"
++    )
++
++    proc = _run_main(work_dir, ["list"], home_dir=home)
++
++    assert proc.returncode == 0, proc.stderr
++    assert (mods_dir / _DB_NAME).exists()
+diff --git a/minecraft_mod_manager/config_file_test.py b/minecraft_mod_manager/config_file_test.py
+new file mode 100644
+index 0000000..3551d67
+--- /dev/null
++++ b/minecraft_mod_manager/config_file_test.py
+@@ -0,0 +1,195 @@
++import json
++from pathlib import Path
++
++import pytest
++
++
++def _config_file_module():
++    """Import the new config_file module lazily so every test fails with a clear
++    message (instead of a collection error) when the feature is not implemented."""
++    try:
++        import minecraft_mod_manager.config_file as config_file
++    except ImportError as exc:  # pragma: no cover - only hit on the unmodified base
++        pytest.fail(f"minecraft_mod_manager.config_file is not implemented: {exc}")
++    return config_file
++
++
++def _write_json(path: Path, data) -> Path:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(data), encoding="utf-8")
++    return path
++
++
++def _isolate_home(tmp_path, monkeypatch) -> Path:
++    home = tmp_path / "home"
++    home.mkdir(parents=True, exist_ok=True)
++    monkeypatch.setenv("HOME", str(home))
++    return home
++
++
++def test_find_config_file_prefers_existing_explicit_path(tmp_path, monkeypatch):
++    config_file = _config_file_module()
++    cwd = tmp_path / "cwd"
++    cwd.mkdir()
++    home = _isolate_home(tmp_path, monkeypatch)
++
++    explicit = _write_json(tmp_path / "explicit.json", {"dir": "."})
++    _write_json(cwd / "minecraft_mod_manager.json", {"dir": "."})
++    _write_json(home / ".minecraft_mod_manager.json", {"dir": "."})
++    monkeypatch.chdir(cwd)
++
++    assert config_file.find_config_file(str(explicit)) == explicit
++
++
++def test_find_config_file_skips_missing_explicit_and_uses_cwd_file(tmp_path, monkeypatch):
++    config_file = _config_file_module()
++    cwd = tmp_path / "cwd"
++    cwd.mkdir()
++    home = _isolate_home(tmp_path, monkeypatch)
++
++    explicit = tmp_path / "missing.json"
++    cwd_file = _write_json(cwd / "minecraft_mod_manager.json", {"dir": "."})
++    _write_json(home / ".minecraft_mod_manager.json", {"dir": "."})
++    monkeypatch.chdir(cwd)
++
++    assert config_file.find_config_file(str(explicit)) == cwd_file
++
++
++def test_find_config_file_checks_cwd_before_home(tmp_path, monkeypatch):
++    config_file = _config_file_module()
++    cwd = tmp_path / "cwd"
++    cwd.mkdir()
++    home = _isolate_home(tmp_path, monkeypatch)
++
++    cwd_file = _write_json(cwd / "minecraft_mod_manager.json", {"dir": "."})
++    home_file = _write_json(home / ".minecraft_mod_manager.json", {"dir": "."})
++    monkeypatch.chdir(cwd)
++
++    assert config_file.find_config_file(None) == cwd_file
++    assert cwd_file != home_file
++
++
++def test_find_config_file_falls_back_to_home_when_no_cwd_file(tmp_path, monkeypatch):
++    config_file = _config_file_module()
++    cwd = tmp_path / "cwd"
++    cwd.mkdir()
++    home = _isolate_home(tmp_path, monkeypatch)
++
++    home_file = _write_json(home / ".minecraft_mod_manager.json", {"dir": "."})
++    monkeypatch.chdir(cwd)
++
++    assert config_file.find_config_file(None) == home_file
++
++
++def test_find_config_file_returns_none_when_nothing_exists(tmp_path, monkeypatch):
++    config_file = _config_file_module()
++    cwd = tmp_path / "cwd"
++    cwd.mkdir()
++    _isolate_home(tmp_path, monkeypatch)
++    monkeypatch.chdir(cwd)
++
++    assert config_file.find_config_file(None) is None
++    assert config_file.find_config_file(str(tmp_path / "does-not-exist.json")) is None
++
++
++def test_load_config_file_returns_parsed_json_object(tmp_path):
++    config_file = _config_file_module()
++    data = {
++        "dir": "mods",
++        "filter": {"version": "1.20", "stability": "release"},
++        "mod_loader": "forge",
++        "minecraft_version": "1.20",
++        "stability": "beta",
++    }
++    path = _write_json(tmp_path / "config.json", data)
++
++    assert config_file.load_config_file(path) == data
++
++
++def test_load_config_file_allows_partial_filter_without_adding_keys(tmp_path):
++    config_file = _config_file_module()
++    data = {"dir": "mods", "filter": {"version": "1.16.5"}}
++    path = _write_json(tmp_path / "config.json", data)
++
++    assert config_file.load_config_file(path) == data
++
++
++def test_load_config_file_raises_with_path_when_file_is_missing(tmp_path):
++    config_file = _config_file_module()
++    missing = tmp_path / "missing.json"
++
++    with pytest.raises(config_file.ConfigFileError) as exc_info:
++        config_file.load_config_file(missing)
++
++    assert str(missing) in str(exc_info.value)
++
++
++def test_load_config_file_raises_with_path_on_invalid_json(tmp_path):
++    config_file = _config_file_module()
++    path = tmp_path / "broken.json"
++    path.write_text("{not valid json", encoding="utf-8")
++
++    with pytest.raises(config_file.ConfigFileError) as exc_info:
++        config_file.load_config_file(path)
++
++    assert str(path) in str(exc_info.value)
++
++
++def test_load_config_file_raises_when_top_level_value_is_not_an_object(tmp_path):
++    config_file = _config_file_module()
++    path = _write_json(tmp_path / "array.json", ["dir", "mods"])
++
++    with pytest.raises(config_file.ConfigFileError) as exc_info:
++        config_file.load_config_file(path)
++
++    assert str(path) in str(exc_info.value)
++
++
++def test_load_config_file_rejects_unknown_top_level_key(tmp_path):
++    config_file = _config_file_module()
++    path = _write_json(tmp_path / "config.json", {"bogus_option": True})
++
++    with pytest.raises(config_file.ConfigFileError) as exc_info:
++        config_file.load_config_file(path)
++
++    assert "bogus_option" in str(exc_info.value)
++
++
++def test_load_config_file_rejects_non_string_dir(tmp_path):
++    config_file = _config_file_module()
++    path = _write_json(tmp_path / "config.json", {"dir": 42})
++
++    with pytest.raises(config_file.ConfigFileError) as exc_info:
++        config_file.load_config_file(path)
++
++    assert "dir" in str(exc_info.value)
++
++
++def test_load_config_file_rejects_filter_that_is_not_an_object(tmp_path):
++    config_file = _config_file_module()
++    path = _write_json(tmp_path / "config.json", {"filter": ["version"]})
++
++    with pytest.raises(config_file.ConfigFileError) as exc_info:
++        config_file.load_config_file(path)
++
++    assert "filter" in str(exc_info.value)
++
++
++def test_load_config_file_rejects_non_string_filter_version(tmp_path):
++    config_file = _config_file_module()
++    path = _write_json(tmp_path / "config.json", {"filter": {"version": 123}})
++
++    with pytest.raises(config_file.ConfigFileError) as exc_info:
++        config_file.load_config_file(path)
++
++    assert "version" in str(exc_info.value)
++
++
++def test_load_config_file_rejects_non_string_filter_stability(tmp_path):
++    config_file = _config_file_module()
++    path = _write_json(tmp_path / "config.json", {"filter": {"stability": False}})
++
++    with pytest.raises(config_file.ConfigFileError) as exc_info:
++        config_file.load_config_file(path)
++
++    assert "stability" in str(exc_info.value)
+diff --git a/minecraft_mod_manager/config_merge_test.py b/minecraft_mod_manager/config_merge_test.py
+new file mode 100644
+index 0000000..7397265
+--- /dev/null
++++ b/minecraft_mod_manager/config_merge_test.py
+@@ -0,0 +1,161 @@
++from argparse import Namespace
++
++import pytest
++
++
++EXPECTED_DEFAULTS = {
++    "dir": ".",
++    "filter": {"version": None, "stability": None},
++    "mod_loader": None,
++    "minecraft_version": None,
++    "stability": None,
++}
++
++
++def _config_merge_module():
++    try:
++        import minecraft_mod_manager.config_merge as config_merge
++    except ImportError as exc:  # pragma: no cover - only hit on the unmodified base
++        pytest.fail(f"minecraft_mod_manager.config_merge is not implemented: {exc}")
++    return config_merge
++
++
++def test_merge_settings_returns_exact_builtin_defaults_when_inputs_are_empty():
++    config_merge = _config_merge_module()
++
++    merged = config_merge.merge_settings({}, Namespace())
++
++    assert merged == EXPECTED_DEFAULTS
++    assert set(merged) == set(EXPECTED_DEFAULTS)
++
++
++def test_merge_settings_cli_dir_overrides_file_dir_and_file_fills_rest():
++    config_merge = _config_merge_module()
++    file_settings = {
++        "dir": "/from-file",
++        "filter": {"version": "1.16", "stability": "release"},
++        "mod_loader": "forge",
++        "minecraft_version": "1.16",
++        "stability": "release",
++    }
++
++    merged = config_merge.merge_settings(file_settings, Namespace(dir="/from-cli"))
++
++    expected = dict(file_settings)
++    expected["dir"] = "/from-cli"
++    assert merged == expected
++
++
++def test_merge_settings_cli_none_values_do_not_override_file_settings():
++    config_merge = _config_merge_module()
++    file_settings = {
++        "dir": "/from-file",
++        "filter": {"version": "1.16", "stability": "release"},
++        "mod_loader": "forge",
++        "minecraft_version": "1.16",
++        "stability": "release",
++    }
++
++    merged = config_merge.merge_settings(
++        file_settings,
++        Namespace(
++            dir=None,
++            filter=None,
++            mod_loader=None,
++            minecraft_version=None,
++            stability=None,
++        ),
++    )
++
++    assert merged == file_settings
++
++
++def test_merge_settings_uses_file_dir_when_cli_attribute_is_absent():
++    config_merge = _config_merge_module()
++
++    merged = config_merge.merge_settings({"dir": "/from-file"}, Namespace())
++
++    expected = dict(EXPECTED_DEFAULTS)
++    expected["dir"] = "/from-file"
++    assert merged == expected
++
++
++def test_merge_settings_cli_mod_loader_overrides_file_mod_loader():
++    config_merge = _config_merge_module()
++
++    merged = config_merge.merge_settings({"mod_loader": "forge"}, Namespace(mod_loader="fabric"))
++
++    expected = dict(EXPECTED_DEFAULTS)
++    expected["mod_loader"] = "fabric"
++    assert merged == expected
++
++
++def test_merge_settings_uses_file_mod_loader_when_cli_is_absent():
++    config_merge = _config_merge_module()
++
++    merged = config_merge.merge_settings({"mod_loader": "quilt"}, Namespace())
++
++    expected = dict(EXPECTED_DEFAULTS)
++    expected["mod_loader"] = "quilt"
++    assert merged == expected
++
++
++def test_merge_settings_cli_minecraft_version_overrides_file_minecraft_version():
++    config_merge = _config_merge_module()
++
++    merged = config_merge.merge_settings({"minecraft_version": "1.16"}, Namespace(minecraft_version="1.20"))
++
++    assert merged["minecraft_version"] == "1.20"
++
++
++def test_merge_settings_uses_file_minecraft_version_when_cli_is_absent():
++    config_merge = _config_merge_module()
++
++    merged = config_merge.merge_settings({"minecraft_version": "1.16"}, Namespace(dir="/irrelevant"))
++
++    assert merged["minecraft_version"] == "1.16"
++
++
++def test_merge_settings_uses_file_stability_when_cli_has_no_stability_attribute():
++    config_merge = _config_merge_module()
++
++    merged = config_merge.merge_settings({"stability": "beta"}, Namespace(dir="/irrelevant"))
++
++    assert merged["stability"] == "beta"
++
++
++def test_merge_settings_cli_stability_attribute_overrides_file_stability():
++    config_merge = _config_merge_module()
++
++    merged = config_merge.merge_settings({"stability": "alpha"}, Namespace(stability="release"))
++
++    assert merged["stability"] == "release"
++
++
++def test_merge_settings_fills_missing_file_filter_subkeys_with_none():
++    config_merge = _config_merge_module()
++
++    merged = config_merge.merge_settings({"filter": {"version": "1.20"}}, Namespace())
++
++    assert merged["filter"] == {"version": "1.20", "stability": None}
++
++
++def test_merge_settings_merges_nested_filter_per_subkey():
++    config_merge = _config_merge_module()
++
++    merged = config_merge.merge_settings(
++        {"filter": {"version": "1.16", "stability": "beta"}},
++        Namespace(filter={"version": "1.20", "stability": None}),
++    )
++
++    assert merged["filter"] == {"version": "1.20", "stability": "beta"}
++
++
++def test_merge_settings_ignores_unknown_file_settings_keys():
++    config_merge = _config_merge_module()
++
++    merged = config_merge.merge_settings({"dir": "/from-file", "random_key": "value"}, Namespace())
++
++    assert set(merged) == set(EXPECTED_DEFAULTS)
++    assert "random_key" not in merged
++    assert merged["dir"] == "/from-file"
+diff --git a/minecraft_mod_manager/config_settings_test.py b/minecraft_mod_manager/config_settings_test.py
+new file mode 100644
+index 0000000..60c6543
+--- /dev/null
++++ b/minecraft_mod_manager/config_settings_test.py
+@@ -0,0 +1,150 @@
++from argparse import Namespace
++from pathlib import Path
++
++from minecraft_mod_manager.config import Config
++from minecraft_mod_manager.core.entities.actions import Actions
++from minecraft_mod_manager.core.entities.mod_loaders import ModLoaders
++from minecraft_mod_manager.core.entities.version_info import Stabilities
++
++
++def _cli_args(**overrides):
++    values = {
++        "action": Actions.install,
++        "pretend": False,
++        "verbose": False,
++        "debug": False,
++        "mods": [],
++        "dir": None,
++        "minecraft_version": None,
++        "mod_loader": None,
++        "alpha": False,
++        "beta": False,
++    }
++    values.update(overrides)
++    return Namespace(**values)
++
++
++def _merged_dict(**overrides):
++    values = {
++        "dir": ".",
++        "filter": {"version": None, "stability": None},
++        "mod_loader": None,
++        "minecraft_version": None,
++        "stability": None,
++    }
++    values.update(overrides)
++    return values
++
++
++def test_add_arg_settings_applies_file_settings_when_cli_values_are_absent(tmp_path):
++    cfg = Config()
++    mods_dir = tmp_path / "mods"
++    file_settings = _merged_dict(
++        dir=str(mods_dir),
++        filter={"version": "1.20", "stability": "release"},
++        mod_loader="forge",
++        minecraft_version="1.20",
++        stability="release",
++    )
++
++    cfg.add_arg_settings(_cli_args(), file_settings)
++
++    assert Path(cfg.dir) == Path(str(mods_dir))
++    assert cfg.filter.version == "1.20"
++    assert cfg.filter.stability == "release" or cfg.filter.stability == Stabilities.release
++    assert cfg.mod_loader == "forge" or cfg.mod_loader == ModLoaders.forge
++    assert cfg.minecraft_version == "1.20"
++    assert cfg.stability == "release" or cfg.stability == Stabilities.release
++    assert cfg.action == Actions.install
++
++
++def test_add_arg_settings_cli_values_override_file_settings(tmp_path):
++    cfg = Config()
++    file_settings = _merged_dict(
++        dir=str(tmp_path / "file_dir"),
++        filter={"version": "1.16", "stability": "release"},
++        mod_loader="forge",
++        minecraft_version="1.16",
++        stability="release",
++    )
++    args = _cli_args(dir=str(tmp_path / "cli_dir"), minecraft_version="1.20", mod_loader="fabric")
++
++    cfg.add_arg_settings(args, file_settings)
++
++    assert Path(cfg.dir) == Path(tmp_path / "cli_dir")
++    assert cfg.minecraft_version == "1.20"
++    assert cfg.mod_loader == "fabric" or cfg.mod_loader == ModLoaders.fabric
++    assert cfg.stability == "release" or cfg.stability == Stabilities.release
++
++
++def test_add_arg_settings_sets_filter_object_from_merged_filter(tmp_path):
++    cfg = Config()
++    file_settings = _merged_dict(
++        dir=str(tmp_path),
++        filter={"version": "1.19.2", "stability": "beta"},
++        minecraft_version="1.19.2",
++        stability="beta",
++    )
++
++    cfg.add_arg_settings(_cli_args(), file_settings)
++
++    assert cfg.filter.version == "1.19.2"
++    assert cfg.filter.stability == "beta" or cfg.filter.stability == Stabilities.beta
++
++
++def test_add_arg_settings_keeps_legacy_attributes_when_file_settings_are_given():
++    cfg = Config()
++    args = _cli_args(action=Actions.configure, debug=True, pretend=True)
++
++    cfg.add_arg_settings(args, _merged_dict(dir="."))
++
++    assert cfg.action == Actions.configure
++    assert cfg.debug is True
++    assert cfg.pretend is True
++
++
++def test_add_arg_settings_without_file_settings_preserves_legacy_behavior():
++    cfg = Config()
++    args = _cli_args(action=Actions.configure, dir=".", debug=True)
++
++    cfg.add_arg_settings(args)
++
++    assert cfg.action == Actions.configure
++    assert cfg.debug is True
++    assert cfg.verbose is True  # debug implies verbose
++    assert Path(cfg.dir) == Path(".")
++
++    # Activate the new feature as well: the optional file_settings argument must
++    # be accepted and keep the legacy args-derived attributes intact.
++    cfg.add_arg_settings(args, _merged_dict(dir=".", mod_loader="quilt", stability="beta"))
++    assert cfg.action == Actions.configure
++    assert cfg.mod_loader == "quilt"
++
++
++def test_add_arg_settings_accepts_new_attribute_names_in_args_namespace():
++    """The merge path reads attributes named exactly like the merged top-level
++    keys, including the nested filter dict."""
++    cfg = Config()
++    args = Namespace(
++        action=Actions.install,
++        pretend=False,
++        verbose=False,
++        debug=False,
++        mods=[],
++        dir=None,
++        filter={"version": "1.20", "stability": None},
++        mod_loader=None,
++        minecraft_version=None,
++        stability="release",
++        alpha=False,
++        beta=False,
++    )
++
++    cfg.add_arg_settings(
++        args,
++        _merged_dict(dir=".", filter={"version": "1.16", "stability": "beta"}, stability="beta"),
++    )
++
++    assert cfg.filter.version == "1.20"
++    assert cfg.stability == "release" or cfg.stability == Stabilities.release
++    assert cfg.filter.stability == "beta" or cfg.filter.stability == Stabilities.beta
+diff --git a/minecraft_mod_manager/config_validation_test.py b/minecraft_mod_manager/config_validation_test.py
+new file mode 100644
+index 0000000..729e379
+--- /dev/null
++++ b/minecraft_mod_manager/config_validation_test.py
+@@ -0,0 +1,114 @@
++import pytest
++
++
++def _config_validation_module():
++    try:
++        import minecraft_mod_manager.config_validation as config_validation
++    except ImportError as exc:  # pragma: no cover - only hit on the unmodified base
++        pytest.fail(f"minecraft_mod_manager.config_validation is not implemented: {exc}")
++    return config_validation
++
++
++def _merged(**overrides):
++    data = {
++        "dir": ".",
++        "filter": {"version": None, "stability": None},
++        "mod_loader": None,
++        "minecraft_version": None,
++        "stability": None,
++    }
++    data.update(overrides)
++    return data
++
++
++def test_validate_config_returns_none_for_valid_existing_directory_and_enums(tmp_path):
++    config_validation = _config_validation_module()
++    merged = _merged(
++        dir=str(tmp_path),
++        filter={"version": "1.20", "stability": "beta"},
++        mod_loader="forge",
++        minecraft_version="1.20",
++        stability="beta",
++    )
++
++    assert config_validation.validate_config(merged) is None
++
++
++def test_validate_config_accepts_directory_that_can_be_created(tmp_path):
++    config_validation = _config_validation_module()
++    creatable_dir = str(tmp_path / "new_mods_folder")
++
++    assert config_validation.validate_config(_merged(dir=creatable_dir)) is None
++
++
++def test_validate_config_rejects_directory_that_is_not_a_string(tmp_path):
++    config_validation = _config_validation_module()
++
++    with pytest.raises(config_validation.ConfigValidationError) as exc_info:
++        config_validation.validate_config(_merged(dir=12345))
++
++    assert "dir" in str(exc_info.value)
++
++
++def test_validate_config_rejects_directory_whose_parent_does_not_exist(tmp_path):
++    config_validation = _config_validation_module()
++    merged = _merged(dir=str(tmp_path / "does-not-exist" / "mods"))
++
++    with pytest.raises(config_validation.ConfigValidationError) as exc_info:
++        config_validation.validate_config(merged)
++
++    assert "dir" in str(exc_info.value)
++
++
++def test_validate_config_rejects_unknown_mod_loader(tmp_path):
++    config_validation = _config_validation_module()
++
++    with pytest.raises(config_validation.ConfigValidationError) as exc_info:
++        config_validation.validate_config(_merged(dir=str(tmp_path), mod_loader="spigot"))
++
++    assert "mod_loader" in str(exc_info.value)
++
++
++def test_validate_config_accepts_all_supported_mod_loaders(tmp_path):
++    config_validation = _config_validation_module()
++
++    for mod_loader in ("forge", "fabric", "quilt"):
++        assert config_validation.validate_config(_merged(dir=str(tmp_path), mod_loader=mod_loader)) is None
++
++
++def test_validate_config_rejects_unknown_stability(tmp_path):
++    config_validation = _config_validation_module()
++
++    with pytest.raises(config_validation.ConfigValidationError) as exc_info:
++        config_validation.validate_config(_merged(dir=str(tmp_path), stability="nightly"))
++
++    assert "stability" in str(exc_info.value)
++
++
++def test_validate_config_accepts_all_supported_stabilities(tmp_path):
++    config_validation = _config_validation_module()
++
++    for stability in ("release", "beta", "alpha"):
++        assert config_validation.validate_config(_merged(dir=str(tmp_path), stability=stability)) is None
++
++
++def test_validate_config_accepts_missing_mod_loader_and_stability(tmp_path):
++    config_validation = _config_validation_module()
++
++    assert config_validation.validate_config(_merged(dir=str(tmp_path))) is None
++
++
++def test_validate_config_collects_all_errors_separated_by_newlines(tmp_path):
++    config_validation = _config_validation_module()
++
++    with pytest.raises(config_validation.ConfigValidationError) as exc_info:
++        config_validation.validate_config(
++            _merged(dir=12345, mod_loader="spigot", stability="nightly")
++        )
++
++    message = str(exc_info.value)
++    assert "dir" in message
++    assert "mod_loader" in message
++    assert "stability" in message
++    assert "\n" in message
++    assert len(message.splitlines()) >= 3

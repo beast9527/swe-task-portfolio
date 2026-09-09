@@ -1,0 +1,459 @@
+diff --git a/minecraft_mod_manager/__main__.py b/minecraft_mod_manager/__main__.py
+index 630f3af..19b30fa 100644
+--- a/minecraft_mod_manager/__main__.py
++++ b/minecraft_mod_manager/__main__.py
+@@ -1,9 +1,15 @@
++import json
++import sys
++
+ from .adapters.repo_impl import RepoImpl
+ from .app.configure.configure import Configure
+ from .app.install.install import Install
+ from .app.show.show import Show
+ from .app.update.update import Update
+ from .config import config
++from .config_file import ConfigFileError, find_config_file, load_config_file
++from .config_merge import merge_settings
++from .config_validation import ConfigValidationError, validate_config
+ from .core.entities.actions import Actions
+ from .gateways.arg_parser import parse_args
+ from .gateways.downloader import Downloader
+@@ -13,7 +19,32 @@ from .gateways.sqlite import Sqlite
+ 
+ def main():
+     args = parse_args()
+-    config.add_arg_settings(args)
++
++    config_path = find_config_file(getattr(args, "config", None))
++    file_settings = None
++    if config_path is not None:
++        try:
++            file_settings = load_config_file(config_path)
++        except ConfigFileError as err:
++            print(str(err), file=sys.stderr)
++            sys.exit(1)
++
++    merged = merge_settings(file_settings if file_settings is not None else {}, args)
++
++    try:
++        validate_config(merged)
++    except ConfigValidationError as err:
++        print(str(err), file=sys.stderr)
++        sys.exit(1)
++
++    if file_settings is not None:
++        config.add_arg_settings(args, merged)
++    else:
++        config.add_arg_settings(args)
++
++    if getattr(args, "print_config", False):
++        print(json.dumps(merged))
++        return
+ 
+     sqlite = Sqlite()
+     jar_parser = JarParser(config.dir)
+diff --git a/minecraft_mod_manager/config.py b/minecraft_mod_manager/config.py
+index 384c237..877f401 100644
+--- a/minecraft_mod_manager/config.py
++++ b/minecraft_mod_manager/config.py
+@@ -1,11 +1,22 @@
+ from importlib.metadata import PackageNotFoundError, version
+ from pathlib import Path
+-from typing import Any, List, Literal, Union
++from typing import Any, Dict, List, Literal, Optional, Union
+ 
++from .config_file import ConfigFileError
++from .config_merge import merge_settings
++from .config_validation import ConfigValidationError
+ from .core.entities.mod import ModArg
+ from .core.entities.mod_loaders import ModLoaders
+ from .core.entities.version_info import Stabilities
+ 
++__all__ = [
++    "Config",
++    "ConfigFileError",
++    "ConfigValidationError",
++    "Filter",
++    "config",
++]
++
+ 
+ class Config:
+     def __init__(self):
+@@ -17,6 +28,9 @@ class Config:
+         self.debug: bool = False
+         self.pretend: bool = False
+         self.dir: Path = Path(".")
++        self.mod_loader: Union[str, None] = None
++        self.minecraft_version: Union[str, None] = None
++        self.stability: Union[str, None] = None
+         self.action: Literal["install", "update", "configure", "list"]
+         self.arg_mods: List[ModArg] = []
+         self.filter = Filter()
+@@ -26,11 +40,14 @@ class Config:
+         except PackageNotFoundError:
+             self.app_version: str = "UNKNOWN"
+ 
+-    def add_arg_settings(self, args: Any):
++    def add_arg_settings(self, args: Any, file_settings: Optional[Dict[str, Any]] = None):
+         """Set additional configuration from script arguments
+ 
+         args:
+-            args (list): All the parsed arguments
++            args: All the parsed arguments
++            file_settings: Optional settings loaded from a config file. When
++                provided these are merged with ``args`` using CLI > file >
++                default precedence before they are applied to the config.
+         """
+         self.action = args.action
+         self.pretend = args.pretend
+@@ -41,6 +58,13 @@ class Config:
+         if args.debug:
+             self.verbose = True
+ 
++        if file_settings is None:
++            self._add_arg_settings_from_args(args)
++        else:
++            self._apply_merged_settings(merge_settings(file_settings, args))
++
++    def _add_arg_settings_from_args(self, args: Any):
++        """Set configuration directly from parsed CLI arguments."""
+         if args.dir:
+             self.dir = Path(args.dir)
+ 
+@@ -55,6 +79,19 @@ class Config:
+         if args.mod_loader:
+             self.filter.loader = ModLoaders.from_name(args.mod_loader)
+ 
++    def _apply_merged_settings(self, merged: Dict[str, Any]):
++        """Apply merged file/CLI/default settings to the config state."""
++        self.dir = Path(merged["dir"])
++
++        self.filter = Filter()
++        self.filter.version = merged["filter"]["version"]
++        self.filter.stability = _stability_from_setting(merged["filter"]["stability"])
++        self.filter.loader = _mod_loader_from_setting(merged["mod_loader"])
++
++        self.mod_loader = merged["mod_loader"]
++        self.minecraft_version = merged["minecraft_version"]
++        self.stability = merged["stability"]
++
+ 
+ class Filter:
+     def __init__(self) -> None:
+@@ -63,4 +100,18 @@ class Filter:
+         self.loader: ModLoaders = ModLoaders.unknown
+ 
+ 
++def _stability_from_setting(stability: Union[str, None]) -> Stabilities:
++    """Convert a stability setting to its enum representation."""
++    if not stability:
++        return Stabilities.release
++    return Stabilities.from_name(stability)
++
++
++def _mod_loader_from_setting(mod_loader: Union[str, None]) -> ModLoaders:
++    """Convert a mod loader setting to its enum representation."""
++    if not mod_loader:
++        return ModLoaders.unknown
++    return ModLoaders.from_name(mod_loader)
++
++
+ config = Config()
+diff --git a/minecraft_mod_manager/config_file.py b/minecraft_mod_manager/config_file.py
+new file mode 100644
+index 0000000..330bc80
+--- /dev/null
++++ b/minecraft_mod_manager/config_file.py
+@@ -0,0 +1,92 @@
++"""Discovery and loading of an optional JSON configuration file."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any, Dict, Optional
++
++CONFIG_FILE_NAME = "minecraft_mod_manager.json"
++
++# Keys that are allowed at the top level of a configuration file.
++ALLOWED_CONFIG_KEYS = ("dir", "filter", "mod_loader", "minecraft_version", "stability")
++
++# Subkeys allowed inside the "filter" object of a configuration file.
++FILTER_CONFIG_KEYS = ("version", "stability")
++
++
++class ConfigFileError(Exception):
++    """Raised when a configuration file cannot be read, parsed or normalized."""
++
++
++def find_config_file(explicit_path: Optional[str]) -> Optional[Path]:
++    """Return the first existing config file among the candidate locations.
++
++    The candidates are checked in the following order:
++        1. ``explicit_path`` when provided
++        2. ``./minecraft_mod_manager.json`` in the current directory
++        3. ``~/.minecraft_mod_manager.json`` in the user's home directory
++
++    When ``explicit_path`` does not exist it is skipped and the search
++    continues with the default locations. If none of the candidates exist,
++    ``None`` is returned.
++
++    Args:
++        explicit_path: Optional path to a configuration file.
++
++    Returns:
++        The first existing candidate path, or ``None``.
++    """
++    candidates: list[Path] = []
++    if explicit_path:
++        candidates.append(Path(explicit_path))
++    candidates.append(Path.cwd() / CONFIG_FILE_NAME)
++    candidates.append(Path.home() / f".{CONFIG_FILE_NAME}")
++
++    for candidate in candidates:
++        if candidate.exists():
++            return candidate
++    return None
++
++
++def load_config_file(path: Path) -> Dict[str, Any]:
++    """Read and parse a JSON configuration file into a normalized dictionary.
++
++    Args:
++        path: Location of the configuration file to read.
++
++    Returns:
++        The parsed top-level JSON object.
++
++    Raises:
++        ConfigFileError: When the file is missing, unreadable, contains
++            invalid JSON, is not a JSON object, contains unknown keys or has
++            values of the wrong type.
++    """
++    try:
++        with open(path, "r", encoding="utf-8") as file:
++            config = json.load(file)
++    except (OSError, ValueError) as err:
++        raise ConfigFileError(f"Could not read config file '{path}': {err}") from err
++
++    if not isinstance(config, dict):
++        raise ConfigFileError(f"Config file '{path}' must contain a JSON object at the top level")
++
++    for key in config:
++        if key not in ALLOWED_CONFIG_KEYS:
++            raise ConfigFileError(f"Invalid config key '{key}' in config file '{path}'")
++
++    if "dir" in config and not isinstance(config["dir"], str):
++        raise ConfigFileError(f"Invalid config value: 'dir' must be a string in config file '{path}'")
++
++    if "filter" in config:
++        filter_config = config["filter"]
++        if not isinstance(filter_config, dict):
++            raise ConfigFileError(f"Invalid config value: 'filter' must be an object in config file '{path}'")
++        for key in FILTER_CONFIG_KEYS:
++            if key in filter_config and not isinstance(filter_config[key], str):
++                raise ConfigFileError(
++                    f"Invalid config value: 'filter.{key}' must be a string in config file '{path}'"
++                )
++
++    return config
+diff --git a/minecraft_mod_manager/config_merge.py b/minecraft_mod_manager/config_merge.py
+new file mode 100644
+index 0000000..8db6b3c
+--- /dev/null
++++ b/minecraft_mod_manager/config_merge.py
+@@ -0,0 +1,96 @@
++"""Merging of configuration file settings, CLI arguments and defaults."""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from typing import Any, Dict
++
++DEFAULT_SETTINGS: Dict[str, Any] = {
++    "dir": ".",
++    "filter": {"version": None, "stability": None},
++    "mod_loader": None,
++    "minecraft_version": None,
++    "stability": None,
++}
++
++# Top level config file keys that act as an alias for a "filter" subkey when no
++# dedicated "filter" value was provided.
++_FILTER_FILE_ALIASES = {"version": "minecraft_version", "stability": "stability"}
++
++
++def merge_settings(file_settings: Dict[str, Any], cli_args: Any) -> Dict[str, Any]:
++    """Merge file settings, CLI arguments and built-in defaults.
++
++    The precedence is strict: CLI arguments override file settings, which
++    override the built-in defaults. The merge is performed per key and the
++    nested ``'filter'`` subkeys are merged individually.
++
++    Args:
++        file_settings: Settings loaded from a config file.
++        cli_args: Parsed command line arguments (e.g. an argparse.Namespace).
++
++    Returns:
++        A dictionary with exactly the keys ``'dir'``, ``'filter'``,
++        ``'mod_loader'``, ``'minecraft_version'`` and ``'stability'``.
++    """
++    return {
++        "dir": _merge_top_level_value("dir", file_settings, cli_args),
++        "filter": {
++            "version": _merge_filter_subkey("version", file_settings, cli_args),
++            "stability": _merge_filter_subkey("stability", file_settings, cli_args),
++        },
++        "mod_loader": _merge_top_level_value("mod_loader", file_settings, cli_args),
++        "minecraft_version": _merge_top_level_value("minecraft_version", file_settings, cli_args),
++        "stability": _merge_top_level_value("stability", file_settings, cli_args),
++    }
++
++
++def _merge_top_level_value(key: str, file_settings: Dict[str, Any], cli_args: Any) -> Any:
++    """Merge a top level setting using CLI > file > default precedence."""
++    cli_value = getattr(cli_args, key, None)
++    if cli_value is not None:
++        return cli_value
++    if key in file_settings:
++        return file_settings[key]
++    return DEFAULT_SETTINGS[key]
++
++
++def _merge_filter_subkey(subkey: str, file_settings: Dict[str, Any], cli_args: Any) -> Any:
++    """Merge a single ``'filter'`` subkey using CLI > file > default."""
++    cli_value = _cli_filter_subkey(subkey, cli_args)
++    if cli_value is not None:
++        return cli_value
++
++    file_filter = file_settings.get("filter")
++    if isinstance(file_filter, Mapping) and file_filter.get(subkey) is not None:
++        return file_filter[subkey]
++
++    alias = _FILTER_FILE_ALIASES[subkey]
++    if alias in file_settings and file_settings[alias] is not None:
++        return file_settings[alias]
++
++    return DEFAULT_SETTINGS["filter"][subkey]
++
++
++def _cli_filter_subkey(subkey: str, cli_args: Any) -> Any:
++    """Return the CLI value for a ``'filter'`` subkey, if any."""
++    cli_filter = getattr(cli_args, "filter", None)
++    if cli_filter is not None:
++        value = _read_member(cli_filter, subkey)
++        if value is not None:
++            return value
++
++    if subkey == "version":
++        return getattr(cli_args, "minecraft_version", None)
++    if subkey == "stability":
++        if getattr(cli_args, "alpha", False):
++            return "alpha"
++        if getattr(cli_args, "beta", False):
++            return "beta"
++    return None
++
++
++def _read_member(source: Any, member: str) -> Any:
++    if isinstance(source, Mapping):
++        return source.get(member)
++    return getattr(source, member, None)
+diff --git a/minecraft_mod_manager/config_validation.py b/minecraft_mod_manager/config_validation.py
+new file mode 100644
+index 0000000..f576287
+--- /dev/null
++++ b/minecraft_mod_manager/config_validation.py
+@@ -0,0 +1,69 @@
++"""Validation of a merged configuration."""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++from typing import Any, Dict, List
++
++MOD_LOADERS = ("forge", "fabric", "quilt")
++STABILITIES = ("release", "beta", "alpha")
++
++
++class ConfigValidationError(Exception):
++    """Raised when a merged configuration fails validation."""
++
++
++def validate_config(merged: Dict[str, Any]) -> None:
++    """Validate a merged configuration.
++
++    Checks that the mod directory is usable, that ``'mod_loader'`` is one of
++    the supported mod loaders and that ``'stability'`` is one of the supported
++    stabilities. All problems are collected and raised together.
++
++    Args:
++        merged: The merged configuration returned by :func:`merge_settings`.
++
++    Raises:
++        ConfigValidationError: When any validation error was found. The message
++            contains every collected error separated by newlines.
++    """
++    errors: List[str] = []
++
++    mod_dir = merged.get("dir")
++    if not isinstance(mod_dir, str):
++        errors.append(f"Invalid configuration: 'dir' must be a string, got '{mod_dir}'")
++    elif not _is_dir_usable(mod_dir):
++        errors.append(
++            f"Invalid configuration: mod directory '{mod_dir}' does not exist and cannot be created"
++        )
++
++    mod_loader = merged.get("mod_loader")
++    if mod_loader is not None and mod_loader not in MOD_LOADERS:
++        errors.append(
++            f"Invalid configuration: 'mod_loader' must be one of {', '.join(MOD_LOADERS)}, got '{mod_loader}'"
++        )
++
++    stability = merged.get("stability")
++    if stability is not None and stability not in STABILITIES:
++        errors.append(
++            f"Invalid configuration: 'stability' must be one of {', '.join(STABILITIES)}, got '{stability}'"
++        )
++
++    if errors:
++        raise ConfigValidationError("\n".join(errors))
++
++
++def _is_dir_usable(mod_dir: str) -> bool:
++    """Return whether ``mod_dir`` exists or can be created.
++
++    A directory can be created when its parent directory exists and is
++    writable.
++    """
++    path = Path(mod_dir)
++    if path.is_dir():
++        return True
++    if path.exists():
++        return False
++    parent = path.parent
++    return parent.is_dir() and os.access(parent, os.W_OK)
+diff --git a/minecraft_mod_manager/gateways/arg_parser.py b/minecraft_mod_manager/gateways/arg_parser.py
+index b7afea4..440070a 100644
+--- a/minecraft_mod_manager/gateways/arg_parser.py
++++ b/minecraft_mod_manager/gateways/arg_parser.py
+@@ -71,6 +71,17 @@ def parse_args():
+         action="store_true",
+         help="Only pretend to install/update/configure. Does not change anything",
+     )
++    parser.add_argument(
++        "--config",
++        help="Path to a JSON configuration file with default settings. "
++        + "If not specified, ./minecraft_mod_manager.json and "
++        + "~/.minecraft_mod_manager.json are checked in that order",
++    )
++    parser.add_argument(
++        "--print-config",
++        action="store_true",
++        help="Print the effective configuration as JSON and exit",
++    )
+     parser.add_argument(
+         "--version",
+         action="version",

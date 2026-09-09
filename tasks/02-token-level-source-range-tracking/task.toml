@@ -1,0 +1,17 @@
+schema_version = "1.0"
+
+[task]
+name = "Token-Level Source Range Tracking and Location-Aware Lexer Diagnostics"
+language = "javascript"
+
+[repository]
+repository_url = "https://github.com/csstree/csstree"
+base_commit_hash = "88e3d965c0b1628642a30a841745b410d6835052"
+
+[environment]
+docker_image = "public.ecr.aws/d3j8x8q7/swe-bench-202605:kh72qraccnjwdet6ynagsccr4x82y65c-v1.1"
+os = "linux"
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+gpus = 0

@@ -1,0 +1,216 @@
+diff --git a/lib/lexer/Lexer.js b/lib/lexer/Lexer.js
+index d09f574..1294903 100644
+--- a/lib/lexer/Lexer.js
++++ b/lib/lexer/Lexer.js
+@@ -66,7 +66,7 @@ function syntaxHasTopLevelCommaMultiplier(syntax) {
+ function buildMatchResult(matched, error, iterations) {
+     return {
+         matched,
+-        iterations,
++        iterations: typeof iterations === 'number' && iterations >= 0 ? iterations : 0,
+         error,
+         ...trace
+     };
+diff --git a/lib/lexer/error.js b/lib/lexer/error.js
+index 89a5400..962d914 100644
+--- a/lib/lexer/error.js
++++ b/lib/lexer/error.js
+@@ -6,7 +6,8 @@ const defaultLoc = { offset: 0, line: 1, column: 1 };
+ function locateMismatch(matchResult, node) {
+     const tokens = matchResult.tokens;
+     const longestMatch = matchResult.longestMatch;
+-    const mismatchNode = longestMatch < tokens.length ? tokens[longestMatch].node || null : null;
++    const mismatchToken = longestMatch < tokens.length ? tokens[longestMatch] : null;
++    const mismatchNode = mismatchToken !== null ? mismatchToken.node || null : null;
+     const badNode = mismatchNode !== node ? mismatchNode : null;
+     let mismatchOffset = 0;
+     let mismatchLength = 0;
+@@ -34,7 +35,14 @@ function locateMismatch(matchResult, node) {
+         css += token;
+     }
+ 
+-    if (longestMatch === tokens.length || entries > 1) { // last
++    if (mismatchToken !== null && mismatchToken.loc && entries <= 1) {
++        // use the token's own location when it's available
++        const tokenLoc = fromLoc(mismatchToken, 'start') ||
++            buildLoc(mismatchToken.loc);
++
++        start = tokenLoc;
++        end = buildLoc(start, mismatchToken.value);
++    } else if (longestMatch === tokens.length || entries > 1) { // last
+         start = fromLoc(badNode || node, 'end') || buildLoc(defaultLoc, css);
+         end = buildLoc(start);
+     } else {
+diff --git a/lib/lexer/prepare-tokens.js b/lib/lexer/prepare-tokens.js
+index 4243fa8..d126ca2 100644
+--- a/lib/lexer/prepare-tokens.js
++++ b/lib/lexer/prepare-tokens.js
+@@ -28,17 +28,12 @@ const astToTokens = {
+ };
+ 
+ function stringToTokens(str) {
+-    const tokens = [];
+-
+-    tokenize(str, (type, start, end) =>
+-        tokens.push({
+-            type,
+-            value: str.slice(start, end),
+-            node: null
+-        })
+-    );
+-
+-    return tokens;
++    return tokenize(str).map(token => ({
++        type: token.type,
++        value: token.value,
++        loc: token.loc,
++        node: null
++    }));
+ }
+ 
+ export default function(value, syntax) {
+diff --git a/lib/tokenizer/OffsetToLocation.js b/lib/tokenizer/OffsetToLocation.js
+index cc584c0..7b73025 100644
+--- a/lib/tokenizer/OffsetToLocation.js
++++ b/lib/tokenizer/OffsetToLocation.js
+@@ -14,11 +14,18 @@ function computeLinesAndColumns(host) {
+     let line = host.startLine;
+     let column = host.startColumn;
+ 
+-    for (let i = startOffset; i < sourceLength; i++) {
++    for (let i = 0; i < sourceLength; i++) {
+         const code = source.charCodeAt(i);
+ 
+         lines[i] = line;
+-        columns[i] = column++;
++        columns[i] = column;
++
++        if (i < startOffset) {
++            // the BOM is not counted as a source character
++            continue;
++        }
++
++        column++;
+ 
+         if (code === N || code === R || code === F) {
+             if (code === R && i + 1 < sourceLength && source.charCodeAt(i + 1) === N) {
+diff --git a/lib/tokenizer/TokenStream.js b/lib/tokenizer/TokenStream.js
+index 7b16b58..9c289ac 100644
+--- a/lib/tokenizer/TokenStream.js
++++ b/lib/tokenizer/TokenStream.js
+@@ -1,6 +1,7 @@
+ import { adoptBuffer } from './adopt-buffer.js';
+ import { cmpStr } from './utils.js';
+ import tokenNames from './names.js';
++import { OffsetToLocation } from './OffsetToLocation.js';
+ import {
+     WhiteSpace,
+     Comment,
+@@ -125,6 +126,7 @@ export class TokenStream {
+         // balance[0] = tokenCount;
+ 
+         this.source = source;
++        this.offsetToLocation = new OffsetToLocation(source);
+         this.firstCharOffset = firstCharOffset === -1 ? 0 : firstCharOffset;
+         this.tokenCount = tokenCount;
+         this.offsetAndType = offsetAndType;
+@@ -222,6 +224,20 @@ export class TokenStream {
+     substrToCursor(start) {
+         return this.source.substring(start, this.tokenStart);
+     }
++    getLocation(offset) {
++        if (offset < 0) {
++            return { line: 1, column: 1 };
++        }
++
++        const location = this.offsetToLocation.getLocation(
++            offset >= this.source.length ? this.source.length : offset
++        );
++
++        return {
++            line: location.line,
++            column: location.column
++        };
++    }
+ 
+     isBlockOpenerTokenType(tokenType) {
+         return blockTokens[tokenType] === BLOCK_OPEN_TOKEN;
+diff --git a/lib/tokenizer/index.js b/lib/tokenizer/index.js
+index 16df44c..2cd4713 100644
+--- a/lib/tokenizer/index.js
++++ b/lib/tokenizer/index.js
+@@ -247,10 +247,48 @@ export function tokenize(source, onToken) {
+     source = String(source || '');
+ 
+     const sourceLength = source.length;
++    const collectTokens = typeof onToken !== 'function';
++    const tokens = collectTokens ? [] : null;
+     let start = isBOM(getCharCode(0));
+     let offset = start;
+     let type;
+ 
++    // The location of a token is computed incrementally as tokens are emitted:
++    // the source is scanned once from the position of the previous token up to
++    // the start offset of the current token. Since tokens are contiguous, the
++    // whole source is scanned at most once and no post-processing pass is needed.
++    let locationOffset = start;
++    let locationLine = 1;
++    let locationColumn = 1;
++
++    function getTokenLocation(tokenStart) {
++        while (locationOffset < tokenStart) {
++            const code = source.charCodeAt(locationOffset);
++
++            if (code === 0x000A || code === 0x000C || code === 0x000D) {
++                // \n, \f or \r; a \r followed by \n is a single line break
++                if (code === 0x000D &&
++                    locationOffset + 1 < tokenStart &&
++                    source.charCodeAt(locationOffset + 1) === 0x000A) {
++                    locationOffset++;
++                }
++
++                locationLine++;
++                locationColumn = 1;
++            } else {
++                locationColumn++;
++            }
++
++            locationOffset++;
++        }
++
++        return {
++            offset: tokenStart,
++            line: locationLine,
++            column: locationColumn
++        };
++    }
++
+     // https://drafts.csswg.org/css-syntax-3/#consume-token
+     // § 4.3.1. Consume a token
+     while (offset < sourceLength) {
+@@ -500,8 +538,24 @@ export function tokenize(source, onToken) {
+         }
+ 
+         // put token to stream
+-        onToken(type, start, start = offset);
++        const tokenStart = start;
++        const tokenEnd = offset;
++        const tokenLoc = getTokenLocation(tokenStart);
++
++        start = tokenEnd;
++
++        if (tokens !== null) {
++            tokens.push({
++                type,
++                value: source.slice(tokenStart, tokenEnd),
++                loc: tokenLoc
++            });
++        } else {
++            onToken(type, tokenStart, tokenEnd, tokenLoc);
++        }
+     }
++
++    return collectTokens ? tokens : undefined;
+ }
+ 
+ export * from './types.js';

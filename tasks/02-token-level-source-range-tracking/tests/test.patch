@@ -1,0 +1,513 @@
+diff --git a/lib/__tests/lexer-match-error-loc.js b/lib/__tests/lexer-match-error-loc.js
+new file mode 100644
+index 0000000..c5dc7c1
+--- /dev/null
++++ b/lib/__tests/lexer-match-error-loc.js
+@@ -0,0 +1,113 @@
++import assert from 'assert';
++import { fork } from 'css-tree';
++import { SyntaxMatchError } from '../lexer/error.js';
++
++function createMismatchError(tokens, longestMatch) {
++    const matchResult = {
++        tokens,
++        reason: 'Mismatch',
++        iterations: 42,
++        match: null,
++        longestMatch
++    };
++
++    return new SyntaxMatchError('Mismatch', null, null, matchResult);
++}
++
++describe('Lexer SyntaxMatchError location diagnostics', () => {
++    it('TestSyntaxMatchErrorLocStartComesFromMismatchedTokenLoc', () => {
++        const tokens = [
++            { value: 'foo(', node: null, loc: { offset: 0, line: 1, column: 1 } },
++            { value: '1', node: null, loc: { offset: 4, line: 1, column: 5 } },
++            { value: ',', node: null, loc: { offset: 5, line: 1, column: 6 } },
++            { value: '2px', node: null, loc: { offset: 100, line: 4, column: 12 } },
++            { value: ')', node: null, loc: { offset: 103, line: 4, column: 15 } }
++        ];
++        const error = createMismatchError(tokens, 3);
++
++        assert.strictEqual(error.loc.start.offset, 100);
++        assert.strictEqual(error.loc.start.line, 4);
++        assert.strictEqual(error.loc.start.column, 12);
++        assert.strictEqual(error.loc.end.offset, 103);
++        assert.strictEqual(error.loc.end.line, 4);
++        assert.strictEqual(error.loc.end.column, 15);
++    });
++
++    it('TestSyntaxMatchErrorTopLevelPositionEqualsStartLoc', () => {
++        const tokens = [
++            { value: 'foo(', node: null, loc: { offset: 0, line: 1, column: 1 } },
++            { value: '1', node: null, loc: { offset: 4, line: 1, column: 5 } },
++            { value: ',', node: null, loc: { offset: 5, line: 1, column: 6 } },
++            { value: '2px', node: null, loc: { offset: 100, line: 4, column: 12 } },
++            { value: ')', node: null, loc: { offset: 103, line: 4, column: 15 } }
++        ];
++        const error = createMismatchError(tokens, 3);
++
++        assert.strictEqual(error.offset, error.loc.start.offset);
++        assert.strictEqual(error.line, error.loc.start.line);
++        assert.strictEqual(error.column, error.loc.start.column);
++        assert.strictEqual(error.offset, 100);
++        assert.strictEqual(error.line, 4);
++        assert.strictEqual(error.column, 12);
++    });
++
++    it('TestSyntaxMatchErrorCssAndMismatchRange', () => {
++        const tokens = [
++            { value: 'foo(', node: null, loc: { offset: 0, line: 1, column: 1 } },
++            { value: '1', node: null, loc: { offset: 4, line: 1, column: 5 } },
++            { value: ',', node: null, loc: { offset: 5, line: 1, column: 6 } },
++            { value: '2px', node: null, loc: { offset: 100, line: 4, column: 12 } },
++            { value: ')', node: null, loc: { offset: 103, line: 4, column: 15 } }
++        ];
++        const error = createMismatchError(tokens, 3);
++
++        assert.strictEqual(error.loc.start.offset, 100);
++        assert.strictEqual(error.loc.start.line, 4);
++        assert.strictEqual(error.css, 'foo(1,2px)');
++        assert.strictEqual(typeof error.mismatchOffset, 'number');
++        assert.strictEqual(typeof error.mismatchLength, 'number');
++        assert.strictEqual(error.mismatchOffset, 6);
++        assert.strictEqual(error.mismatchLength, 3);
++    });
++
++    it('TestSyntaxMatchErrorLocForMismatchOnLaterLine', () => {
++        const tokens = [
++            { value: 'a', node: null, loc: { offset: 0, line: 1, column: 1 } },
++            { value: ' ', node: null, loc: { offset: 1, line: 1, column: 2 } },
++            { value: 'b', node: null, loc: { offset: 200, line: 8, column: 5 } }
++        ];
++        const error = createMismatchError(tokens, 2);
++
++        assert.strictEqual(error.loc.start.offset, 200);
++        assert.strictEqual(error.loc.start.line, 8);
++        assert.strictEqual(error.loc.start.column, 5);
++        assert.strictEqual(error.loc.end.offset, 201);
++        assert.strictEqual(error.loc.end.line, 8);
++        assert.strictEqual(error.loc.end.column, 6);
++        assert.strictEqual(error.offset, 200);
++        assert.strictEqual(error.line, 8);
++        assert.strictEqual(error.column, 5);
++        assert.strictEqual(error.css, 'a b');
++    });
++
++    it('TestSyntaxMatchErrorLocUsesSourceOffsetsOfMismatchedToken', () => {
++        const customSyntax = fork(prev => ({
++            ...prev,
++            types: {
++                'foo()': 'foo( <number>#{3} )'
++            }
++        }));
++        const source = '\uFEFFfoo(1, 2px, 3)';
++        const { error } = customSyntax.lexer.match('<foo()>', source);
++
++        assert.notStrictEqual(error, null);
++        assert.strictEqual(error.name, 'SyntaxMatchError');
++        // a leading BOM is skipped by the tokenizer, so the css-relative mismatch
++        // offset and the real source offset of the mismatched token differ
++        assert.notStrictEqual(error.loc.start.offset, error.mismatchOffset);
++        assert.strictEqual(error.loc.start.offset, 8);
++        assert.strictEqual(error.loc.start.line, 1);
++        assert.strictEqual(error.loc.end.offset, 11);
++        assert.strictEqual(error.offset, 8);
++    });
++});
+diff --git a/lib/__tests/lexer-match-iterations.js b/lib/__tests/lexer-match-iterations.js
+new file mode 100644
+index 0000000..f0dc5a8
+--- /dev/null
++++ b/lib/__tests/lexer-match-iterations.js
+@@ -0,0 +1,85 @@
++import assert from 'assert';
++import { lexer, parse } from 'css-tree';
++
++function assertNonNegativeInteger(value, label) {
++    assert.strictEqual(typeof value, 'number', label + ' should be a number');
++    assert(Number.isInteger(value), label + ' should be an integer');
++    assert(value >= 0, label + ' should be non-negative');
++}
++
++describe('Lexer match result iterations', () => {
++    it('TestLexerMatchCustomPropertyResultHasIterations', () => {
++        const result = lexer.matchProperty('--custom', '1px solid red');
++
++        assert.strictEqual(result.matched, null);
++        assert.notStrictEqual(result.error, null);
++        assertNonNegativeInteger(result.iterations, 'iterations');
++    });
++
++    it('TestLexerMatchUnknownTypeResultHasIterations', () => {
++        const result = lexer.matchType('this-type-does-not-exist', '1');
++
++        assert.strictEqual(result.matched, null);
++        assert.notStrictEqual(result.error, null);
++        assertNonNegativeInteger(result.iterations, 'iterations');
++    });
++
++    it('TestLexerMatchBadSyntaxResultHasIterations', () => {
++        const result = lexer.match({}, '1');
++
++        assert.strictEqual(result.matched, null);
++        assert.notStrictEqual(result.error, null);
++        assertNonNegativeInteger(result.iterations, 'iterations');
++    });
++
++    it('TestLexerMatchDeclarationNonDeclarationResultHasIterations', () => {
++        const result = lexer.matchDeclaration({ type: 'Raw', value: 'not a declaration' });
++
++        assert.strictEqual(result.matched, null);
++        assert.notStrictEqual(result.error, null);
++        assertNonNegativeInteger(result.iterations, 'iterations');
++    });
++
++    it('TestLexerMatchPropertyWithVarResultHasIterations', () => {
++        const value = parse('var(--x)', { context: 'value' });
++        const result = lexer.matchProperty('background', value);
++
++        assert.strictEqual(result.matched, null);
++        assert.notStrictEqual(result.error, null);
++        assertNonNegativeInteger(result.iterations, 'iterations');
++    });
++
++    it('TestLexerMatchUnknownAtrulePreludeResultHasIterations', () => {
++        const result = lexer.matchAtrulePrelude('this-atrule-does-not-exist', 'x');
++
++        assert.strictEqual(result.matched, null);
++        assert.notStrictEqual(result.error, null);
++        assertNonNegativeInteger(result.iterations, 'iterations');
++    });
++
++    it('TestLexerMatchUnknownAtruleDescriptorResultHasIterations', () => {
++        const result = lexer.matchAtruleDescriptor('font-face', 'this-descriptor-does-not-exist', 'x');
++
++        assert.strictEqual(result.matched, null);
++        assert.notStrictEqual(result.error, null);
++        assertNonNegativeInteger(result.iterations, 'iterations');
++    });
++
++    it('TestLexerMatchCustomPropertyDeclarationResultHasIterations', () => {
++        const ast = parse('a { --foo: red; }');
++        const declaration = ast.children.first.block.children.first;
++        const result = lexer.matchDeclaration(declaration);
++
++        assert.strictEqual(result.matched, null);
++        assert.notStrictEqual(result.error, null);
++        assertNonNegativeInteger(result.iterations, 'iterations');
++    });
++
++    it('TestLexerMatchAtrulePreludeWithoutPreludeReportsZeroIterations', () => {
++        const result = lexer.matchAtrulePrelude('font-face', '');
++
++        assert.strictEqual(result.matched, null);
++        assert.strictEqual(result.error, null);
++        assert.strictEqual(result.iterations, 0);
++    });
++});
+diff --git a/lib/__tests/token-stream-get-location.js b/lib/__tests/token-stream-get-location.js
+new file mode 100644
+index 0000000..51272c6
+--- /dev/null
++++ b/lib/__tests/token-stream-get-location.js
+@@ -0,0 +1,99 @@
++import assert from 'assert';
++import { TokenStream, tokenize } from 'css-tree';
++
++function createStream(source) {
++    return new TokenStream(source, tokenize);
++}
++
++function assertLocation(actual, line, column) {
++    assert.strictEqual(typeof actual, 'object');
++    assert.strictEqual(actual.line, line, 'line');
++    assert.strictEqual(actual.column, column, 'column');
++}
++
++describe('TokenStream#getLocation()', () => {
++    it('TestTokenStreamGetLocationIsAFunction', () => {
++        const stream = createStream('a');
++
++        assert.strictEqual(typeof stream.getLocation, 'function');
++    });
++
++    it('TestTokenStreamGetLocationAtLineStart', () => {
++        const stream = createStream('ab\ncd');
++
++        assertLocation(stream.getLocation(0), 1, 1);
++        assertLocation(stream.getLocation(3), 2, 1);
++    });
++
++    it('TestTokenStreamGetLocationMapsOffsetToColumn', () => {
++        const stream = createStream('ab\ncd');
++
++        assertLocation(stream.getLocation(1), 1, 2);
++        assertLocation(stream.getLocation(2), 1, 3);
++        assertLocation(stream.getLocation(4), 2, 2);
++    });
++
++    it('TestTokenStreamGetLocationOfNewlineCharacter', () => {
++        const stream = createStream('ab\ncd');
++
++        assertLocation(stream.getLocation(2), 1, 3);
++    });
++
++    it('TestTokenStreamGetLocationAtSourceEnd', () => {
++        const stream = createStream('ab\ncd');
++
++        // offset equal to source length is the position after the last character
++        assertLocation(stream.getLocation(5), 2, 3);
++    });
++
++    it('TestTokenStreamGetLocationBeyondSourceEndReturnsEndLocation', () => {
++        const stream = createStream('ab\ncd');
++
++        assertLocation(stream.getLocation(5), 2, 3);
++        assertLocation(stream.getLocation(6), 2, 3);
++        assertLocation(stream.getLocation(100), 2, 3);
++    });
++
++    it('TestTokenStreamGetLocationWithNegativeOffset', () => {
++        const stream = createStream('ab\ncd');
++
++        assertLocation(stream.getLocation(-1), 1, 1);
++        assertLocation(stream.getLocation(-100), 1, 1);
++    });
++
++    it('TestTokenStreamGetLocationWithTrailingNewline', () => {
++        const stream = createStream('one\ntwo\n');
++
++        assertLocation(stream.getLocation(0), 1, 1);
++        assertLocation(stream.getLocation(3), 1, 4);
++        assertLocation(stream.getLocation(7), 2, 4);
++        assertLocation(stream.getLocation(8), 3, 1);
++        assertLocation(stream.getLocation(9), 3, 1);
++    });
++
++    it('TestTokenStreamGetLocationHandlesCarriageReturnLineFeed', () => {
++        const stream = createStream('a\r\nb');
++
++        assertLocation(stream.getLocation(0), 1, 1);
++        assertLocation(stream.getLocation(1), 1, 2);
++        assertLocation(stream.getLocation(3), 2, 1);
++        assertLocation(stream.getLocation(4), 2, 2);
++    });
++
++    it('TestTokenStreamGetLocationForEmptySource', () => {
++        const stream = createStream('');
++
++        assertLocation(stream.getLocation(0), 1, 1);
++        assertLocation(stream.getLocation(-1), 1, 1);
++        assertLocation(stream.getLocation(1), 1, 1);
++    });
++
++    it('TestTokenStreamGetLocationIsZeroBased', () => {
++        const stream = createStream('\n\na');
++
++        assertLocation(stream.getLocation(0), 1, 1);
++        assertLocation(stream.getLocation(1), 2, 1);
++        assertLocation(stream.getLocation(2), 3, 1);
++        assertLocation(stream.getLocation(3), 3, 2);
++    });
++});
+diff --git a/lib/__tests/tokenize-loc.js b/lib/__tests/tokenize-loc.js
+new file mode 100644
+index 0000000..b302ab1
+--- /dev/null
++++ b/lib/__tests/tokenize-loc.js
+@@ -0,0 +1,192 @@
++import assert from 'assert';
++import { tokenize, tokenNames, OffsetToLocation } from 'css-tree';
++
++function tokenizeWithLoc(source) {
++    const tokens = [];
++
++    tokenize(source, (type, start, end, loc) => {
++        tokens.push({ type, start, end, loc });
++    });
++
++    return tokens;
++}
++
++function locOf(token) {
++    assert(
++        token.loc !== null && typeof token.loc === 'object',
++        `token "${tokenNames[token.type]}" at ${token.start}..${token.end} is missing a loc object`
++    );
++
++    return token.loc;
++}
++
++function assertLocEqual(actual, offset, line, column) {
++    assert.strictEqual(actual.offset, offset, 'loc.offset');
++    assert.strictEqual(actual.line, line, 'loc.line');
++    assert.strictEqual(actual.column, column, 'loc.column');
++}
++
++describe('tokenize token loc', () => {
++    it('TestTokenizeLocAttachesLocObjectToSingleToken', () => {
++        const tokens = tokenizeWithLoc('abc');
++
++        assert.strictEqual(tokens.length, 1);
++        assertLocEqual(locOf(tokens[0]), 0, 1, 1);
++    });
++
++    it('TestTokenizeLocAttachesLocToEveryTokenOfTheStream', () => {
++        const tokens = tokenizeWithLoc('.foo {\n  color: red;\n}');
++
++        assert(tokens.length > 1);
++        for (const token of tokens) {
++            const loc = locOf(token);
++
++            assert.strictEqual(typeof loc.offset, 'number');
++            assert.strictEqual(typeof loc.line, 'number');
++            assert.strictEqual(typeof loc.column, 'number');
++            assert.strictEqual(loc.offset, token.start, 'loc.offset should equal the token start offset');
++        }
++    });
++
++    it('TestTokenizeLocFirstTokenOffsetIsZero', () => {
++        const tokens = tokenizeWithLoc('a + b');
++        const loc = locOf(tokens[0]);
++
++        assertLocEqual(loc, 0, 1, 1);
++    });
++
++    it('TestTokenizeLocOffsetMatchesTokenStart', () => {
++        const source = '.foo {\n  color: red;\n}';
++        const tokens = tokenizeWithLoc(source);
++        const offsetToLocation = new OffsetToLocation(source);
++
++        for (const token of tokens) {
++            const loc = locOf(token);
++
++            assert.strictEqual(loc.offset, token.start);
++            assert.strictEqual(loc.offset, offsetToLocation.getLocation(token.start).offset);
++        }
++    });
++
++    it('TestTokenizeLocColumnIncrementsInsideSameLine', () => {
++        const tokens = tokenizeWithLoc('a  b');
++
++        assert.strictEqual(tokens.length, 3);
++        assertLocEqual(locOf(tokens[0]), 0, 1, 1);
++        assertLocEqual(locOf(tokens[1]), 1, 1, 2);
++        assertLocEqual(locOf(tokens[2]), 3, 1, 4);
++    });
++
++    it('TestTokenizeLocLineIncrementsAfterLf', () => {
++        const tokens = tokenizeWithLoc('a\nb');
++
++        assert.strictEqual(tokens.length, 3);
++        assertLocEqual(locOf(tokens[0]), 0, 1, 1);
++        assertLocEqual(locOf(tokens[1]), 1, 1, 2);
++        assertLocEqual(locOf(tokens[2]), 2, 2, 1);
++    });
++
++    it('TestTokenizeLocColumnResetsAfterIndentedLineBreak', () => {
++        const tokens = tokenizeWithLoc('a\n  b');
++
++        assert.strictEqual(tokens.length, 3);
++        assertLocEqual(locOf(tokens[0]), 0, 1, 1);
++        assertLocEqual(locOf(tokens[1]), 1, 1, 2);
++        assertLocEqual(locOf(tokens[2]), 4, 2, 3);
++    });
++
++    it('TestTokenizeLocHandlesCarriageReturnLineFeed', () => {
++        const tokens = tokenizeWithLoc('a\r\nb');
++
++        assert.strictEqual(tokens.length, 3);
++        assertLocEqual(locOf(tokens[0]), 0, 1, 1);
++        assertLocEqual(locOf(tokens[1]), 1, 1, 2);
++        assertLocEqual(locOf(tokens[2]), 3, 2, 1);
++    });
++
++    it('TestTokenizeLocTracksSeveralLinesInRow', () => {
++        const tokens = tokenizeWithLoc('x\ny\nz');
++
++        assert.strictEqual(tokens.length, 5);
++        assertLocEqual(locOf(tokens[0]), 0, 1, 1);
++        assertLocEqual(locOf(tokens[1]), 1, 1, 2);
++        assertLocEqual(locOf(tokens[2]), 2, 2, 1);
++        assertLocEqual(locOf(tokens[3]), 3, 2, 2);
++        assertLocEqual(locOf(tokens[4]), 4, 3, 1);
++    });
++
++    it('TestTokenizeLocForNewlineLeadingSource', () => {
++        const tokens = tokenizeWithLoc('\n  a');
++
++        assert.strictEqual(tokens.length, 2);
++        assertLocEqual(locOf(tokens[0]), 0, 1, 1);
++        assertLocEqual(locOf(tokens[1]), 3, 2, 3);
++    });
++
++    it('TestTokenizeLocMatchesOffsetToLocationForRichCss', () => {
++        const source = '.foo:hover {\n  color: rgb(1, 2px, 3);\n  /* comment */\r\n  content: "str";\n}';
++        const tokens = tokenizeWithLoc(source);
++        const offsetToLocation = new OffsetToLocation(source);
++
++        assert(tokens.length > 5);
++        for (const token of tokens) {
++            const expected = offsetToLocation.getLocation(token.start);
++            const loc = locOf(token);
++
++            assertLocEqual(loc, expected.offset, expected.line, expected.column);
++        }
++    });
++
++    it('TestTokenizeLocDoesNotChangeTokenTypeRangeAndValue', () => {
++        const source = '.foo {\n  color: red;\n}';
++        const tokens = tokenizeWithLoc(source);
++        const expectedTypes = [
++            'delim-token', 'ident-token', 'whitespace-token', '{-token',
++            'whitespace-token', 'ident-token', 'colon-token', 'whitespace-token',
++            'ident-token', 'semicolon-token', 'whitespace-token', '}-token'
++        ];
++        const expectedRanges = [
++            [0, 1], [1, 4], [4, 5], [5, 6], [6, 9], [9, 14],
++            [14, 15], [15, 16], [16, 19], [19, 20], [20, 21], [21, 22]
++        ];
++
++        assert.strictEqual(tokens.length, expectedTypes.length);
++        tokens.forEach((token, index) => {
++            const loc = locOf(token);
++
++            assert.strictEqual(loc.offset, token.start);
++            assert.strictEqual(tokenNames[token.type], expectedTypes[index]);
++            assert.deepStrictEqual([token.start, token.end], expectedRanges[index]);
++            assert.strictEqual(source.slice(token.start, token.end), source.slice(expectedRanges[index][0], expectedRanges[index][1]));
++        });
++    });
++
++    it('TestTokenizeLocTokenValuesReconstructSource', () => {
++        const source = '/*x*/ .a > b:not(c) { m:1px; }';
++        const tokens = tokenizeWithLoc(source);
++
++        for (const token of tokens) {
++            locOf(token);
++        }
++
++        assert.strictEqual(
++            tokens.map(token => source.slice(token.start, token.end)).join(''),
++            source
++        );
++    });
++
++    it('TestTokenizeLocKeepsOffsetAlignedWithStartAfterBom', () => {
++        const tokens = tokenizeWithLoc('\uFEFFfoo(1)');
++
++        assert.strictEqual(tokens.length, 3);
++        for (const token of tokens) {
++            const loc = locOf(token);
++
++            assert.strictEqual(loc.offset, token.start);
++        }
++        assert.strictEqual(tokens[0].start, 1);
++        assert.strictEqual(locOf(tokens[0]).line, 1);
++        assert.strictEqual(typeof locOf(tokens[0]).column, 'number');
++        assert.strictEqual(tokens[1].start, 5);
++    });
++});

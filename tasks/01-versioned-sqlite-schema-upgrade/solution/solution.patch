@@ -1,0 +1,472 @@
+diff --git a/minecraft_mod_manager/__main__.py b/minecraft_mod_manager/__main__.py
+index 630f3af..1e6e66c 100644
+--- a/minecraft_mod_manager/__main__.py
++++ b/minecraft_mod_manager/__main__.py
+@@ -1,6 +1,8 @@
+ from .adapters.repo_impl import RepoImpl
+ from .app.configure.configure import Configure
+ from .app.install.install import Install
++from .app.schema_info.schema_info import SchemaInfo
++from .app.schema_info.schema_info_repo import SchemaInfoRepo
+ from .app.show.show import Show
+ from .app.update.update import Update
+ from .config import config
+@@ -15,6 +17,15 @@ def main():
+     args = parse_args()
+     config.add_arg_settings(args)
+ 
++    if config.action == Actions.schema_info:
++        schema_info_repo = SchemaInfoRepo()
++        try:
++            schema_info = SchemaInfo(schema_info_repo)
++            schema_info.execute()
++        finally:
++            schema_info_repo.close()
++        return
++
+     sqlite = Sqlite()
+     jar_parser = JarParser(config.dir)
+     downloader = Downloader()
+diff --git a/minecraft_mod_manager/app/schema_info/schema_info.py b/minecraft_mod_manager/app/schema_info/schema_info.py
+new file mode 100644
+index 0000000..4b8c73e
+--- /dev/null
++++ b/minecraft_mod_manager/app/schema_info/schema_info.py
+@@ -0,0 +1,14 @@
++from .schema_info_repo import SchemaInfoRepo
++
++
++class SchemaInfo:
++    """Prints the schema version and integrity status of the database."""
++
++    def __init__(self, schema_info_repo: SchemaInfoRepo) -> None:
++        self._repo = schema_info_repo
++
++    def execute(self) -> None:
++        version = self._repo.get_schema_version()
++        integrity = "ok" if self._repo.verify_integrity() else "corrupt"
++        print(f"Schema version: {version}")
++        print(f"Integrity: {integrity}")
+diff --git a/minecraft_mod_manager/app/schema_info/schema_info_repo.py b/minecraft_mod_manager/app/schema_info/schema_info_repo.py
+new file mode 100644
+index 0000000..5ca8cce
+--- /dev/null
++++ b/minecraft_mod_manager/app/schema_info/schema_info_repo.py
+@@ -0,0 +1,29 @@
++import sqlite3
++from os import path
++from typing import Union
++
++from ...config import config
++from ...gateways.sqlite_upgrader import SqliteUpgrader
++
++
++class SchemaInfoRepo:
++    """Reads schema version and integrity information from the SQLite database."""
++
++    def __init__(self, connection: Union[sqlite3.Connection, None] = None) -> None:
++        self._owns_connection = connection is None
++        if connection is None:
++            file_path = path.join(config.dir, f".{config.app_name}.db")
++            connection = sqlite3.connect(file_path)
++        self._connection = connection
++        self._cursor = self._connection.cursor()
++        self._upgrader = SqliteUpgrader(self._connection, self._cursor)
++
++    def get_schema_version(self) -> int:
++        return self._upgrader.get_schema_version()
++
++    def verify_integrity(self) -> bool:
++        return self._upgrader.verify_integrity()
++
++    def close(self) -> None:
++        if self._owns_connection:
++            self._connection.close()
+diff --git a/minecraft_mod_manager/core/entities/actions.py b/minecraft_mod_manager/core/entities/actions.py
+index 2e46b0c..cffd67a 100644
+--- a/minecraft_mod_manager/core/entities/actions.py
++++ b/minecraft_mod_manager/core/entities/actions.py
+@@ -9,6 +9,7 @@ class Actions(Enum):
+     update = "update"
+     configure = "configure"
+     list = "list"
++    schema_info = "schema-info"
+ 
+     @staticmethod
+     def from_name(name: str) -> Union[Actions, None]:
+diff --git a/minecraft_mod_manager/gateways/arg_parser.py b/minecraft_mod_manager/gateways/arg_parser.py
+index b7afea4..c775a26 100644
+--- a/minecraft_mod_manager/gateways/arg_parser.py
++++ b/minecraft_mod_manager/gateways/arg_parser.py
+@@ -15,7 +15,7 @@ def parse_args():
+     parser.add_argument(
+         "action",
+         choices=Actions.get_all_names_as_list(),
+-        help="What you want to do. version prints the version of this application",
++        help="What you want to do. schema-info prints the schema version and database integrity",
+     )
+     parser.add_argument(
+         "mods",
+@@ -81,6 +81,7 @@ def parse_args():
+     args = parser.parse_args()
+     args.action = Actions.from_name(args.action)
+     args.mods = _parse_mods(args.mods)
++    config.action = args.action
+     return args
+ 
+ 
+diff --git a/minecraft_mod_manager/gateways/migration_registry.py b/minecraft_mod_manager/gateways/migration_registry.py
+new file mode 100644
+index 0000000..23965bd
+--- /dev/null
++++ b/minecraft_mod_manager/gateways/migration_registry.py
+@@ -0,0 +1,38 @@
++import sqlite3
++from typing import Callable, Dict, List
++
++Migration = Callable[[sqlite3.Connection], None]
++
++
++class MigrationRegistry:
++    """Manages deterministic schema migrations keyed by version number."""
++
++    def __init__(self) -> None:
++        self._migrations: Dict[int, Migration] = {}
++
++    def register(self, version: int, func: Migration) -> None:
++        """Store the migration function for the given version."""
++        if version in self._migrations:
++            raise ValueError(f"Migration for version {version} already registered")
++        self._migrations[version] = func
++
++    def versions(self) -> List[int]:
++        """Return all registered versions in ascending order."""
++        return sorted(self._migrations.keys())
++
++    def migrate(self, conn: sqlite3.Connection, from_version: int, to_version: int) -> None:
++        """Apply every registered migration with a version in (from_version, to_version]."""
++        if from_version > to_version:
++            raise ValueError("from_version must be less than or equal to to_version")
++
++        for version in range(from_version + 1, to_version + 1):
++            if version not in self._migrations:
++                raise ValueError(f"Missing migration for version {version}")
++
++        for version in range(from_version + 1, to_version + 1):
++            self._migrations[version](conn)
++
++    def validate_contiguous(self) -> bool:
++        """Return True if registered versions are contiguous and start at 1."""
++        versions = self.versions()
++        return versions == list(range(1, len(versions) + 1))
+diff --git a/minecraft_mod_manager/gateways/sqlite_upgrader.py b/minecraft_mod_manager/gateways/sqlite_upgrader.py
+index bc6a780..1d65e5e 100644
+--- a/minecraft_mod_manager/gateways/sqlite_upgrader.py
++++ b/minecraft_mod_manager/gateways/sqlite_upgrader.py
+@@ -1,39 +1,231 @@
+ import sqlite3
++from datetime import datetime
++from pathlib import Path
++from typing import Union
+ 
++from ..config import config
+ from ..core.entities.sites import Sites
++from .migration_registry import MigrationRegistry
++
++
++def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
++    """Recreate the mod table with the v1 schema, discarding any v0 rows."""
++    conn.execute("DROP TABLE IF EXISTS mod")
++    conn.execute(
++        "CREATE TABLE mod ("
++        + "id TEXT UNIQUE, "
++        + "site TEXT, "
++        + "site_id TEXT, "
++        + "site_slug TEXT, "
++        + "upload_time INTEGER, "
++        + "active INTEGER)"
++    )
++
++
++def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
++    """Move the per-site columns of every v1 row into the combined sites column."""
++    rows = conn.execute("SELECT * FROM mod").fetchall()
++    conn.execute("DROP TABLE mod")
++    conn.execute(
++        "CREATE TABLE mod ("
++        + "id TEXT UNIQUE, "
++        + "sites TEXT, "
++        + "upload_time INTEGER, "
++        + "active INTEGER)"
++    )
++
++    for row in rows:
++        id, site, site_id, site_slug, upload_time, active = row
++
++        combined_site = ""
++        if site:
++            try:
++                if site_id == "None":
++                    site_id = ""
++                if site_slug == "None":
++                    site_slug = ""
++
++                valid_site = Sites[site]
++                combined_site = f"{valid_site.value}:{site_id}:{site_slug}"
++            except KeyError:
++                # Skip if the site is invalid 'unknown'
++                pass
++
++        conn.execute(
++            "INSERT INTO mod (id, sites, upload_time, active) VALUES (?, ?, ?, ?)",
++            (id, combined_site, upload_time, active),
++        )
+ 
+ 
+ class SqliteUpgrader:
++    """Upgrades the SQLite schema using versioned, transactional migrations."""
++
+     _version = 2
+ 
+-    def __init__(self, connection: sqlite3.Connection, cursor: sqlite3.Cursor) -> None:
++    def __init__(
++        self,
++        connection: sqlite3.Connection,
++        cursor: Union[sqlite3.Cursor, None] = None,
++        migration_registry: Union[MigrationRegistry, None] = None,
++    ) -> None:
+         self._connection = connection
+-        self._cursor = cursor
++        self._cursor = cursor if cursor is not None else connection.cursor()
++        self._registry = (
++            migration_registry
++            if migration_registry is not None
++            else self._create_default_registry()
++        )
++        self._uses_default_registry = migration_registry is None
+ 
+-    def upgrade(self):
+-        # First run time
+-        if not self._mod_table_exists():
+-            self._create_version_table()
+-            self._create_mod_table()
+-            self._connection.commit()
++    @property
++    def registry(self) -> MigrationRegistry:
++        """The registry of migration functions used by this upgrader."""
++        return self._registry
++
++    @registry.setter
++    def registry(self, registry: MigrationRegistry) -> None:
++        self._registry = registry
++        self._uses_default_registry = False
++
++    def _create_default_registry(self) -> MigrationRegistry:
++        registry = MigrationRegistry()
++        registry.register(1, _migrate_0_to_1)
++        registry.register(2, _migrate_1_to_2)
++        return registry
++
++    def upgrade(self) -> None:
++        """Apply all pending migrations, backing up the database first."""
++        latest_version = self._latest_version()
++        if latest_version == 0:
+             return
+ 
+-        version = self._get_version()
++        current_version = self._get_current_version()
++        if current_version >= latest_version:
++            # Already up to date. Do not create a backup or run any migrations.
++            return
+ 
+-        # Upgrade tables one version at a time
+-        if version <= 0:
+-            self._v0_to_v1()
+-        if version <= 1:
+-            self._v1_to_v2()
++        # Pending migrations exist whenever the recorded version is below the
++        # latest registered version, regardless of which tables already exist.
++        backup_path = self.backup_database()
++        try:
++            self._connection.execute("BEGIN")
++            self._create_schema_version_table()
++            self.registry.migrate(self._connection, current_version, latest_version)
++            self._set_schema_version(latest_version)
++            if self._uses_default_registry or self._version_table_exists():
++                self._sync_legacy_version_table(latest_version)
++            self._connection.commit()
++        except Exception as e:
++            try:
++                self._connection.rollback()
++            except sqlite3.Error:
++                pass
++            self.restore_database(backup_path)
++            e.args = (f"{e} Migration failed, database restored to previous state",)
++            raise
+ 
+-        # Update version
+-        self._cursor.execute("UPDATE version SET version=?", [SqliteUpgrader._version])
+-        self._connection.commit()
++    def backup_database(self) -> Path:
++        """Create a timestamped backup of the database file and return its path."""
++        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
++        backup_path = self._find_free_backup_path(timestamp)
++        backup_connection = sqlite3.connect(str(backup_path))
++        try:
++            self._connection.backup(backup_connection)
++        finally:
++            backup_connection.close()
++        return backup_path
++
++    def restore_database(self, backup_path: Path) -> None:
++        """Overwrite the database with the contents of the backup file."""
++        backup_path = Path(backup_path)
++        if not backup_path.exists():
++            raise FileNotFoundError(f"Backup file not found: {backup_path}")
++
++        self._connection.rollback()
++        backup_connection = sqlite3.connect(str(backup_path))
++        try:
++            backup_connection.backup(self._connection)
++        finally:
++            backup_connection.close()
++
++    def verify_integrity(self) -> bool:
++        """Return True only if PRAGMA integrity_check reports 'ok'."""
++        try:
++            self._cursor.execute("PRAGMA integrity_check")
++            result = self._cursor.fetchall()
++        except sqlite3.Error:
++            return False
++        return len(result) == 1 and result[0][0] == "ok"
++
++    def get_schema_version(self) -> int:
++        """Return the version stored in the schema_version table, or 0 if absent."""
++        if not self._schema_version_table_exists():
++            return 0
++        self._cursor.execute("SELECT version FROM schema_version")
++        row = self._cursor.fetchone()
++        if row is None:
++            return 0
++        return int(row[0])
++
++    def _latest_version(self) -> int:
++        versions = self.registry.versions()
++        if not versions:
++            return 0
++        return versions[-1]
++
++    def _get_current_version(self) -> int:
++        if self._schema_version_table_exists():
++            self._cursor.execute("SELECT version FROM schema_version")
++            row = self._cursor.fetchone()
++            if row is not None:
++                return int(row[0])
++        # Compatibility with databases created by older versions of the application.
++        return self._get_version()
++
++    def _db_path(self) -> Path:
++        row = self._connection.execute("PRAGMA database_list").fetchone()
++        if row and row[2]:
++            return Path(row[2])
++        return Path(config.dir).joinpath(f".{config.app_name}.db")
++
++    def _find_free_backup_path(self, timestamp: str) -> Path:
++        backup_dir = self._db_path().parent
++        backup_path = backup_dir / f"backup-{timestamp}.db"
++        counter = 1
++        while backup_path.exists():
++            backup_path = backup_dir / f"backup-{timestamp}-{counter}.db"
++            counter += 1
++        return backup_path
++
++    def _create_schema_version_table(self) -> None:
++        self._cursor.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER)")
++
++    def _schema_version_table_exists(self) -> bool:
++        self._cursor.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='schema_version'")
++        return self._cursor.fetchone()[0] == 1
++
++    def _set_schema_version(self, version: int) -> None:
++        self._cursor.execute("SELECT count(*) FROM schema_version")
++        if self._cursor.fetchone()[0] == 0:
++            self._cursor.execute("INSERT INTO schema_version (version) VALUES (?)", [version])
++        else:
++            self._cursor.execute("UPDATE schema_version SET version=?", [version])
++
++    def _sync_legacy_version_table(self, version: int) -> None:
++        """Keep the legacy version table in sync with the new schema_version row."""
++        self._cursor.execute("CREATE TABLE IF NOT EXISTS version (version INTEGER)")
++        self._cursor.execute("SELECT count(*) FROM version")
++        if self._cursor.fetchone()[0] == 0:
++            self._cursor.execute("INSERT INTO version (version) VALUES (?)", [version])
++        else:
++            self._cursor.execute("UPDATE version SET version=?", [version])
+ 
+     def _get_version(self) -> int:
+         if self._version_table_exists():
+             self._cursor.execute("SELECT version FROM version")
+-            return int(self._cursor.fetchone()[0])
++            row = self._cursor.fetchone()
++            if row is not None:
++                return int(row[0])
+         return 0
+ 
+     def _version_table_exists(self):
+@@ -47,17 +239,6 @@ class SqliteUpgrader:
+     def _create_mod_table(self):
+         self._create_mod_table_v2()
+ 
+-    def _create_mod_table_v1(self):
+-        self._connection.execute(
+-            "CREATE TABLE IF NOT EXISTS mod ("
+-            + "id TEXT UNIQUE, "
+-            + "site TEXT, "
+-            + "site_id TEXT, "
+-            + "site_slug TEXT, "
+-            + "upload_time INTEGER, "
+-            + "active INTEGER)"
+-        )
+-
+     def _create_mod_table_v2(self):
+         self._connection.execute(
+             "CREATE TABLE IF NOT EXISTS mod ("
+@@ -72,36 +253,10 @@ class SqliteUpgrader:
+         self._cursor.execute("INSERT INTO version (version) VALUES (?)", [SqliteUpgrader._version])
+ 
+     def _v0_to_v1(self):
+-        # Just remove mod table and create it again...
+-        self._cursor.execute("DROP TABLE mod")
+-        self._create_mod_table_v1()
++        _migrate_0_to_1(self._connection)
+         self._create_version_table()
+         self._connection.commit()
+ 
+     def _v1_to_v2(self):
+-        self._cursor.execute("SELECT * FROM mod")
+-        rows = self._cursor.fetchall()
+-        self._cursor.execute("DROP TABLE mod")
+-        self._create_mod_table_v2()
+-
+-        for row in rows:
+-            id, site, site_id, site_slug, upload_time, active = row
+-
+-            combined_site = ""
+-            if site:
+-                try:
+-                    if site_id == "None":
+-                        site_id = ""
+-                    if site_slug == "None":
+-                        site_slug = ""
+-
+-                    valid_site = Sites[site]
+-                    combined_site = f"{valid_site.value}:{site_id}:{site_slug}"
+-                except KeyError:
+-                    # Skip if the site is invalid 'unknown'
+-                    pass
+-
+-            new = (id, combined_site, upload_time, active)
+-            self._cursor.execute("INSERT INTO mod (id, sites, upload_time, active) VALUES (?, ?, ?, ?)", new)
+-
++        _migrate_1_to_2(self._connection)
+         self._connection.commit()

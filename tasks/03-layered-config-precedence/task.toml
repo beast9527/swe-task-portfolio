@@ -1,0 +1,17 @@
+schema_version = "1.0"
+
+[task]
+name = "Config File Support with Layered Precedence and Validation"
+language = "python"
+
+[repository]
+repository_url = "https://github.com/Senth/minecraft-mod-manager"
+base_commit_hash = "2782e2ed818d8586be2bc01474acecc10cee4e74"
+
+[environment]
+docker_image = "docker.io/swerebenchv2/senth-minecraft-mod-manager:82-2782e2e"
+os = "linux"
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+gpus = 0

@@ -1,0 +1,783 @@
+diff --git a/minecraft_mod_manager/gateways/migration_registry_test.py b/minecraft_mod_manager/gateways/migration_registry_test.py
+new file mode 100644
+index 0000000..49e5a44
+--- /dev/null
++++ b/minecraft_mod_manager/gateways/migration_registry_test.py
+@@ -0,0 +1,234 @@
++import sqlite3
++
++import pytest
++
++
++def _load_registry():
++    from minecraft_mod_manager.gateways.migration_registry import MigrationRegistry
++
++    return MigrationRegistry
++
++
++def _memory_connection() -> sqlite3.Connection:
++    return sqlite3.connect(":memory:")
++
++
++def _registry_with(*versions) -> "tuple[MigrationRegistry, list]":
++    """Create a registry whose migrations record the applied version in order."""
++    MigrationRegistry = _load_registry()
++    registry = MigrationRegistry()
++    applied: list = []
++    for version in versions:
++
++        def migration(conn, version=version):
++            applied.append(version)
++            conn.execute(f"CREATE TABLE IF NOT EXISTS migrated_{version} (x INTEGER)")
++
++        registry.register(version, migration)
++    return registry, applied
++
++
++def test_migration_registry_versions_sorted_ascending():
++    registry, _ = _registry_with(3, 1, 5, 2)
++
++    assert registry.versions() == [1, 2, 3, 5]
++
++
++def test_migration_registry_versions_empty_list():
++    MigrationRegistry = _load_registry()
++    registry = MigrationRegistry()
++
++    assert registry.versions() == []
++
++
++def test_migration_registry_register_duplicate_raises_exact_message():
++    MigrationRegistry = _load_registry()
++    registry = MigrationRegistry()
++    registry.register(2, lambda conn: None)
++
++    with pytest.raises(ValueError) as excinfo:
++        registry.register(2, lambda conn: None)
++
++    assert str(excinfo.value) == "Migration for version 2 already registered"
++
++
++def test_migration_registry_register_duplicate_error_contains_version_number():
++    MigrationRegistry = _load_registry()
++    registry = MigrationRegistry()
++    registry.register(7, lambda conn: None)
++
++    with pytest.raises(ValueError) as excinfo:
++        registry.register(7, lambda conn: None)
++
++    assert "7" in str(excinfo.value)
++    assert str(excinfo.value) == "Migration for version 7 already registered"
++
++
++def test_migration_registry_migrate_applies_versions_in_ascending_order():
++    conn = _memory_connection()
++    registry, applied = _registry_with(1, 2, 3)
++
++    try:
++        registry.migrate(conn, 0, 3)
++    finally:
++        conn.close()
++
++    assert applied == [1, 2, 3]
++
++
++def test_migration_registry_migrate_skips_versions_at_or_below_from_version():
++    conn = _memory_connection()
++    registry, applied = _registry_with(1, 2, 3, 4)
++
++    try:
++        registry.migrate(conn, 1, 3)
++    finally:
++        conn.close()
++
++    assert applied == [2, 3]
++
++
++def test_migration_registry_migrate_includes_to_version():
++    conn = _memory_connection()
++    registry, applied = _registry_with(1, 2, 3)
++
++    try:
++        registry.migrate(conn, 0, 2)
++    finally:
++        conn.close()
++
++    assert applied == [1, 2]
++    assert 3 not in applied
++
++
++def test_migration_registry_migrate_from_version_greater_than_to_raises():
++    conn = _memory_connection()
++    registry, _ = _registry_with(1, 2, 3)
++
++    try:
++        with pytest.raises(ValueError) as excinfo:
++            registry.migrate(conn, 5, 2)
++    finally:
++        conn.close()
++
++    assert str(excinfo.value) == "from_version must be less than or equal to to_version"
++
++
++def test_migration_registry_migrate_from_gt_to_checked_before_missing_versions():
++    conn = _memory_connection()
++    registry, _ = _registry_with(1)
++
++    try:
++        with pytest.raises(ValueError) as excinfo:
++            registry.migrate(conn, 4, 2)
++    finally:
++        conn.close()
++
++    assert str(excinfo.value) == "from_version must be less than or equal to to_version"
++
++
++def test_migration_registry_migrate_missing_version_raises_exact_message():
++    conn = _memory_connection()
++    registry, _ = _registry_with(1, 2, 4)
++
++    try:
++        with pytest.raises(ValueError) as excinfo:
++            registry.migrate(conn, 0, 4)
++    finally:
++        conn.close()
++
++    assert str(excinfo.value) == "Missing migration for version 3"
++
++
++def test_migration_registry_migrate_missing_first_required_version_raises():
++    conn = _memory_connection()
++    registry, _ = _registry_with(1)
++
++    try:
++        with pytest.raises(ValueError) as excinfo:
++            registry.migrate(conn, 0, 2)
++    finally:
++        conn.close()
++
++    assert str(excinfo.value) == "Missing migration for version 2"
++
++
++def test_migration_registry_migrate_stops_after_migration_exception():
++    conn = _memory_connection()
++    MigrationRegistry = _load_registry()
++    applied: list = []
++    registry = MigrationRegistry()
++
++    def version_one(conn):
++        applied.append(1)
++        conn.execute("CREATE TABLE migrated_1 (x INTEGER)")
++
++    def version_two(conn):
++        applied.append(2)
++        raise RuntimeError("boom in migration 2")
++
++    def version_three(conn):
++        applied.append(3)
++        conn.execute("CREATE TABLE migrated_3 (x INTEGER)")
++
++    registry.register(1, version_one)
++    registry.register(2, version_two)
++    registry.register(3, version_three)
++
++    try:
++        with pytest.raises(RuntimeError):
++            registry.migrate(conn, 0, 3)
++    finally:
++        conn.close()
++
++    assert applied == [1, 2]
++    assert 3 not in applied
++
++
++def test_migration_registry_migrate_propagates_original_exception_message():
++    conn = _memory_connection()
++    MigrationRegistry = _load_registry()
++    registry = MigrationRegistry()
++
++    def failing_migration(conn):
++        raise ValueError("original failure text")
++
++    registry.register(1, failing_migration)
++
++    try:
++        with pytest.raises(ValueError) as excinfo:
++            registry.migrate(conn, 0, 1)
++    finally:
++        conn.close()
++
++    assert str(excinfo.value) == "original failure text"
++
++
++def test_migration_registry_validate_contiguous_true_for_1_2_3():
++    registry, _ = _registry_with(1, 2, 3)
++
++    assert registry.validate_contiguous() is True
++
++
++def test_migration_registry_validate_contiguous_true_for_single_version_one():
++    registry, _ = _registry_with(1)
++
++    assert registry.validate_contiguous() is True
++
++
++def test_migration_registry_validate_contiguous_false_when_version_one_missing():
++    registry, _ = _registry_with(2, 3, 4)
++
++    assert registry.validate_contiguous() is False
++
++
++def test_migration_registry_validate_contiguous_false_for_gap_in_middle():
++    registry, _ = _registry_with(1, 2, 4, 5)
++
++    assert registry.validate_contiguous() is False
++
++
++def test_migration_registry_validate_contiguous_false_when_not_starting_at_one():
++    registry, _ = _registry_with(0, 1, 2)
++
++    assert registry.validate_contiguous() is False
+diff --git a/minecraft_mod_manager/gateways/schema_info_test.py b/minecraft_mod_manager/gateways/schema_info_test.py
+new file mode 100644
+index 0000000..89b3b6b
+--- /dev/null
++++ b/minecraft_mod_manager/gateways/schema_info_test.py
+@@ -0,0 +1,93 @@
++import re
++import sys
++
++from minecraft_mod_manager.config import config
++from minecraft_mod_manager.core.entities.actions import Actions
++from minecraft_mod_manager.gateways.arg_parser import parse_args
++
++
++class _StubSchemaInfoRepo:
++    """Minimal SchemaInfoRepo test double exposing only the documented repo methods."""
++
++    def __init__(self, version: int, integrity: bool):
++        self._version = version
++        self._integrity = integrity
++
++    def get_schema_version(self) -> int:
++        return self._version
++
++    def verify_integrity(self) -> bool:
++        return self._integrity
++
++
++def test_actions_enum_exposes_schema_info():
++    schema_info = Actions.from_name("schema-info")
++
++    assert schema_info is not None
++    assert schema_info.value == "schema-info"
++
++
++def test_schema_info_parse_args_sets_schema_info_action(monkeypatch):
++    monkeypatch.setattr(sys, "argv", ["mmm", "schema-info"])
++
++    args = parse_args()
++
++    schema_info = Actions.from_name("schema-info")
++    assert schema_info is not None
++    assert args.action == schema_info
++    assert args.action.value == "schema-info"
++
++
++def test_schema_info_execute_prints_ok_lines(capsys):
++    from minecraft_mod_manager.app.schema_info.schema_info import SchemaInfo
++
++    SchemaInfo(_StubSchemaInfoRepo(version=4, integrity=True)).execute()
++
++    assert capsys.readouterr().out == "Schema version: 4\nIntegrity: ok\n"
++
++
++def test_schema_info_execute_prints_corrupt_lines(capsys):
++    from minecraft_mod_manager.app.schema_info.schema_info import SchemaInfo
++
++    SchemaInfo(_StubSchemaInfoRepo(version=9, integrity=False)).execute()
++
++    assert capsys.readouterr().out == "Schema version: 9\nIntegrity: corrupt\n"
++
++
++def test_schema_info_execute_prints_fresh_db_zero_version(capsys):
++    from minecraft_mod_manager.app.schema_info.schema_info import SchemaInfo
++
++    SchemaInfo(_StubSchemaInfoRepo(version=0, integrity=True)).execute()
++
++    assert capsys.readouterr().out == "Schema version: 0\nIntegrity: ok\n"
++
++
++def test_main_schema_info_action_prints_schema_and_integrity(monkeypatch, capsys, tmp_path):
++    saved_dir = config.dir
++    saved_action = getattr(config, "action", None)
++    saved_pretend = config.pretend
++    saved_verbose = config.verbose
++    saved_debug = config.debug
++    saved_arg_mods = config.arg_mods
++    monkeypatch.setattr(config, "dir", tmp_path)
++    monkeypatch.setattr(sys, "argv", ["mmm", "schema-info", "-d", str(tmp_path)])
++    try:
++        import minecraft_mod_manager.__main__ as main_module
++
++        main_module.main()
++    finally:
++        config.dir = saved_dir
++        config.pretend = saved_pretend
++        config.verbose = saved_verbose
++        config.debug = saved_debug
++        config.arg_mods = saved_arg_mods
++        if saved_action is None:
++            if hasattr(config, "action"):
++                del config.action
++        else:
++            config.action = saved_action
++
++    lines = capsys.readouterr().out.splitlines()
++    assert len(lines) == 2
++    assert re.fullmatch(r"Schema version: \d+", lines[0]), lines
++    assert lines[1] == "Integrity: ok", lines
+diff --git a/minecraft_mod_manager/gateways/sqlite_upgrader_schema_upgrade_test.py b/minecraft_mod_manager/gateways/sqlite_upgrader_schema_upgrade_test.py
+new file mode 100644
+index 0000000..d7f5b1e
+--- /dev/null
++++ b/minecraft_mod_manager/gateways/sqlite_upgrader_schema_upgrade_test.py
+@@ -0,0 +1,438 @@
++import re
++import sqlite3
++from datetime import datetime, timedelta
++from pathlib import Path
++
++import pytest
++
++from minecraft_mod_manager.gateways.sqlite_upgrader import SqliteUpgrader
++
++
++BACKUP_NAME_PATTERN = re.compile(r"^backup-\d{8}-\d{6}(-\d+)?\.db$")
++
++
++def _open_upgrader(db_file: Path) -> "tuple[sqlite3.Connection, sqlite3.Cursor, SqliteUpgrader]":
++    connection = sqlite3.connect(str(db_file))
++    cursor = connection.cursor()
++    return connection, cursor, SqliteUpgrader(connection, cursor)
++
++
++def _backup_files(directory: Path) -> list:
++    return sorted(
++        path
++        for path in Path(directory).iterdir()
++        if path.is_file() and path.name.startswith("backup-") and path.name.endswith(".db")
++    )
++
++
++def _two_step_registry():
++    """Registry with versions 1 and 2 that record every applied migration."""
++    from minecraft_mod_manager.gateways.migration_registry import MigrationRegistry
++
++    registry = MigrationRegistry()
++    applied: list = []
++
++    def migrate_to_v1(conn):
++        applied.append(1)
++        conn.execute("CREATE TABLE step_1 (x INTEGER)")
++
++    def migrate_to_v2(conn):
++        applied.append(2)
++        conn.execute("CREATE TABLE step_2 (x INTEGER)")
++
++    registry.register(1, migrate_to_v1)
++    registry.register(2, migrate_to_v2)
++    return registry, applied
++
++
++def test_backup_database_creates_timestamped_file_beside_database(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    try:
++        connection.execute("CREATE TABLE sample (id INTEGER)")
++        connection.commit()
++
++        backup_path = upgrader.backup_database()
++
++        assert isinstance(backup_path, Path)
++        assert backup_path.parent == tmp_path
++        assert backup_path.exists()
++        assert re.fullmatch(r"backup-\d{8}-\d{6}\.db", backup_path.name), backup_path.name
++        assert backup_path in _backup_files(tmp_path)
++    finally:
++        connection.close()
++
++
++def test_backup_database_snapshot_contains_database_contents(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    try:
++        connection.execute("CREATE TABLE sample (id INTEGER, name TEXT)")
++        connection.execute("INSERT INTO sample VALUES (1, 'alpha')")
++        connection.execute("INSERT INTO sample VALUES (2, 'beta')")
++        connection.commit()
++
++        backup_path = upgrader.backup_database()
++
++        backup_connection = sqlite3.connect(str(backup_path))
++        try:
++            rows = backup_connection.execute("SELECT id, name FROM sample ORDER BY id").fetchall()
++        finally:
++            backup_connection.close()
++        assert rows == [(1, "alpha"), (2, "beta")]
++    finally:
++        connection.close()
++
++
++def test_backup_database_appends_unique_suffix_on_name_collision(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    try:
++        connection.execute("CREATE TABLE sample (id INTEGER)")
++        connection.execute("INSERT INTO sample VALUES (7)")
++        connection.commit()
++
++        # Occupy the would-be base names around the current local time so the
++        # implementation must pick a unique suffixed name.
++        now = datetime.now()
++        for delta in (-2, -1, 0, 1, 2):
++            stamp = (now + timedelta(seconds=delta)).strftime("%Y%m%d-%H%M%S")
++            (tmp_path / f"backup-{stamp}.db").write_bytes(b"")
++
++        backup_path = upgrader.backup_database()
++
++        assert backup_path.exists()
++        assert re.fullmatch(r"backup-\d{8}-\d{6}-\d+\.db", backup_path.name), backup_path.name
++
++        backup_connection = sqlite3.connect(str(backup_path))
++        try:
++            rows = backup_connection.execute("SELECT id FROM sample").fetchall()
++        finally:
++            backup_connection.close()
++        assert rows == [(7,)]
++    finally:
++        connection.close()
++
++
++def test_restore_database_replaces_database_with_backup_content(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    try:
++        connection.execute("CREATE TABLE sample (id INTEGER)")
++        connection.execute("INSERT INTO sample VALUES (10)")
++        connection.commit()
++
++        backup_path = upgrader.backup_database()
++
++        # Destroy the live schema after the backup was taken.
++        connection.execute("DROP TABLE sample")
++        connection.commit()
++
++        upgrader.restore_database(backup_path)
++
++        check_connection = sqlite3.connect(str(db_file))
++        try:
++            rows = check_connection.execute("SELECT id FROM sample").fetchall()
++        finally:
++            check_connection.close()
++        assert rows == [(10,)]
++        assert upgrader.verify_integrity() is True
++    finally:
++        connection.close()
++
++
++def test_restore_database_discards_changes_made_after_backup(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    try:
++        connection.execute("CREATE TABLE sample (id INTEGER)")
++        connection.execute("INSERT INTO sample VALUES (10)")
++        connection.commit()
++
++        backup_path = upgrader.backup_database()
++
++        connection.execute("INSERT INTO sample VALUES (99)")
++        connection.execute("CREATE TABLE extra (x INTEGER)")
++        connection.commit()
++
++        upgrader.restore_database(backup_path)
++
++        check_connection = sqlite3.connect(str(db_file))
++        try:
++            rows = check_connection.execute("SELECT id FROM sample ORDER BY id").fetchall()
++            table_count = check_connection.execute(
++                "SELECT count(name) FROM sqlite_master WHERE type='table' AND name='extra'"
++            ).fetchone()[0]
++        finally:
++            check_connection.close()
++        assert rows == [(10,)]
++        assert table_count == 0
++    finally:
++        connection.close()
++
++
++def test_restore_database_missing_backup_raises_file_not_found(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    missing = tmp_path / "backup-20200101-000000.db"
++    try:
++        with pytest.raises(FileNotFoundError) as excinfo:
++            upgrader.restore_database(missing)
++    finally:
++        connection.close()
++
++    assert str(excinfo.value) == f"Backup file not found: {missing}"
++
++
++def test_verify_integrity_returns_true_for_healthy_database(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    try:
++        connection.execute("CREATE TABLE sample (id INTEGER)")
++        connection.commit()
++
++        assert upgrader.verify_integrity() is True
++    finally:
++        connection.close()
++
++
++def test_verify_integrity_returns_false_for_corrupted_database(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection = sqlite3.connect(str(db_file))
++    connection.execute("CREATE TABLE sample (a TEXT, b INTEGER)")
++    connection.executemany(
++        "INSERT INTO sample VALUES (?, ?)",
++        [("value-%d" % i, i) for i in range(50000)],
++    )
++    connection.commit()
++    connection.close()
++
++    data = bytearray(db_file.read_bytes())
++    tail = len(data) // 4
++    data[-tail:] = b"\x00" * tail
++    db_file.write_bytes(bytes(data))
++
++    corrupted_connection = sqlite3.connect(str(db_file))
++    corrupted_cursor = corrupted_connection.cursor()
++    upgrader = SqliteUpgrader(corrupted_connection, corrupted_cursor)
++    try:
++        assert upgrader.verify_integrity() is False
++    finally:
++        corrupted_connection.close()
++
++
++def test_get_schema_version_zero_when_table_missing(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    try:
++        assert upgrader.get_schema_version() == 0
++    finally:
++        connection.close()
++
++
++def test_get_schema_version_zero_when_table_empty(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    try:
++        connection.execute("CREATE TABLE schema_version (version INTEGER)")
++        connection.commit()
++
++        assert upgrader.get_schema_version() == 0
++    finally:
++        connection.close()
++
++
++def test_get_schema_version_returns_stored_integer(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    try:
++        connection.execute("CREATE TABLE schema_version (version INTEGER)")
++        connection.execute("INSERT INTO schema_version (version) VALUES (5)")
++        connection.commit()
++
++        assert upgrader.get_schema_version() == 5
++    finally:
++        connection.close()
++
++
++def test_upgrade_applies_all_migrations_in_order_and_records_version(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, _ = _open_upgrader(db_file)
++    registry, applied = _two_step_registry()
++    upgrader = SqliteUpgrader(connection, cursor, migration_registry=registry)
++    try:
++        upgrader.upgrade()
++
++        assert applied == [1, 2]
++        assert upgrader.get_schema_version() == 2
++        version_row = connection.execute("SELECT version FROM schema_version").fetchone()
++        assert version_row == (2,)
++        row_count = connection.execute("SELECT count(*) FROM schema_version").fetchone()[0]
++        assert row_count == 1
++        step_tables = {
++            name
++            for (name,) in connection.execute(
++                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('step_1', 'step_2')"
++            )
++        }
++        assert step_tables == {"step_1", "step_2"}
++    finally:
++        connection.close()
++
++
++def test_upgrade_applies_only_pending_migrations_after_current_version(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, _ = _open_upgrader(db_file)
++    connection.execute("CREATE TABLE schema_version (version INTEGER)")
++    connection.execute("INSERT INTO schema_version (version) VALUES (1)")
++    connection.execute("CREATE TABLE step_1 (x INTEGER)")
++    connection.commit()
++
++    registry, applied = _two_step_registry()
++    upgrader = SqliteUpgrader(connection, cursor, migration_registry=registry)
++    try:
++        upgrader.upgrade()
++
++        assert applied == [2]
++        assert upgrader.get_schema_version() == 2
++        step_2_count = connection.execute(
++            "SELECT count(name) FROM sqlite_master WHERE type='table' AND name='step_2'"
++        ).fetchone()[0]
++        assert step_2_count == 1
++    finally:
++        connection.close()
++
++
++def test_upgrade_creates_backup_before_applying_migrations(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, _ = _open_upgrader(db_file)
++    registry, _ = _two_step_registry()
++    upgrader = SqliteUpgrader(connection, cursor, migration_registry=registry)
++    try:
++        upgrader.upgrade()
++
++        backups = _backup_files(tmp_path)
++        assert len(backups) == 1
++    finally:
++        connection.close()
++
++
++def test_upgrade_skips_work_when_already_at_latest_version(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, _ = _open_upgrader(db_file)
++    registry, applied = _two_step_registry()
++    upgrader = SqliteUpgrader(connection, cursor, migration_registry=registry)
++    try:
++        upgrader.upgrade()
++        assert len(_backup_files(tmp_path)) == 1
++
++        applied.clear()
++        backups_before = _backup_files(tmp_path)
++        upgrader.upgrade()
++        backups_after = _backup_files(tmp_path)
++
++        assert backups_before == backups_after
++        assert applied == []
++        assert upgrader.get_schema_version() == 2
++    finally:
++        connection.close()
++
++
++def test_upgrade_failure_restores_database_and_adds_message(tmp_path):
++    from minecraft_mod_manager.gateways.migration_registry import MigrationRegistry
++
++    db_file = tmp_path / "data.db"
++    connection, cursor, _ = _open_upgrader(db_file)
++    registry = MigrationRegistry()
++
++    def migrate_to_v1(conn):
++        conn.execute("CREATE TABLE step_1 (x INTEGER)")
++
++    def failing_v2(conn):
++        raise RuntimeError("boom during migration")
++
++    registry.register(1, migrate_to_v1)
++    registry.register(2, failing_v2)
++    upgrader = SqliteUpgrader(connection, cursor, migration_registry=registry)
++    try:
++        with pytest.raises(RuntimeError) as excinfo:
++            upgrader.upgrade()
++    finally:
++        connection.close()
++
++    assert "Migration failed, database restored to previous state" in str(excinfo.value)
++    assert "boom during migration" in str(excinfo.value)
++
++    # The database file must be back to its pre-upgrade (empty) state.
++    check_connection = sqlite3.connect(str(db_file))
++    try:
++        tables = [
++            name
++            for (name,) in check_connection.execute(
++                "SELECT name FROM sqlite_master WHERE type='table'"
++            )
++        ]
++    finally:
++        check_connection.close()
++    assert tables == []
++
++    assert len(_backup_files(tmp_path)) == 1
++
++
++def test_upgrade_failed_migration_restores_backup_on_default_registry(tmp_path, monkeypatch):
++    from minecraft_mod_manager.gateways.migration_registry import MigrationRegistry
++
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    connection.execute("CREATE TABLE keep_me (x INTEGER)")
++    connection.execute("INSERT INTO keep_me VALUES (1)")
++    connection.commit()
++
++    real_migrate = MigrationRegistry.migrate
++
++    def exploding_migrate(self, conn, from_version, to_version):
++        if from_version < to_version:
++            conn.execute("CREATE TABLE partial_step (x INTEGER)")
++            raise RuntimeError("synthetic migration failure")
++        return real_migrate(self, conn, from_version, to_version)
++
++    monkeypatch.setattr(MigrationRegistry, "migrate", exploding_migrate)
++    try:
++        with pytest.raises(RuntimeError) as excinfo:
++            upgrader.upgrade()
++    finally:
++        connection.close()
++
++    assert "Migration failed, database restored to previous state" in str(excinfo.value)
++
++    # The failed upgrade must leave the pre-upgrade content intact and remove the
++    # partial work written by the failing migration step.
++    check_connection = sqlite3.connect(str(db_file))
++    try:
++        tables = {
++            name
++            for (name,) in check_connection.execute(
++                "SELECT name FROM sqlite_master WHERE type='table'"
++            )
++        }
++        rows = check_connection.execute("SELECT x FROM keep_me").fetchall()
++    finally:
++        check_connection.close()
++    assert "keep_me" in tables
++    assert "partial_step" not in tables
++    assert rows == [(1,)]
++
++
++def test_upgrade_on_fresh_database_creates_schema_version_table(tmp_path):
++    db_file = tmp_path / "data.db"
++    connection, cursor, upgrader = _open_upgrader(db_file)
++    try:
++        upgrader.upgrade()
++
++        row = connection.execute("SELECT version FROM schema_version").fetchone()
++        assert row is not None
++        stored_version = int(row[0])
++        assert stored_version >= 1
++        assert upgrader.get_schema_version() == stored_version
++    finally:
++        connection.close()
